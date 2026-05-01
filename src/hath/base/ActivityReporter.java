@@ -82,7 +82,7 @@ public class ActivityReporter implements Runnable {
 					Settings.getTelemetryFlushInterval(),
 					Settings.getTelemetryHeartbeatInterval()
 			);
-			Out.info("ActivityReporter: Enabled endpoint=" + endpoint.trim() + " heartbeat=" + Settings.getTelemetryHeartbeatInterval() + "s flush=" + Settings.getTelemetryFlushInterval() + "s batch=" + Settings.getTelemetryBatchSize() + " queue=" + Settings.getTelemetryMaxQueue());
+			Out.info("ActivityReporter: Enabled endpoint=" + endpoint.trim() + " heartbeat=" + Settings.getTelemetryHeartbeatInterval() + "s flush=" + Settings.getTelemetryFlushInterval() + "s batch=" + Settings.getTelemetryBatchSize() + " queue=" + Settings.getTelemetryMaxQueue() + " name=" + Settings.getTelemetryName() + " timeout=" + Settings.getTelemetryTimeout() + "s");
 			instance.start();
 		}
 	}
@@ -218,10 +218,17 @@ public class ActivityReporter implements Runnable {
 	private String buildPayload(List<ActivityEvent> events, boolean includeHeartbeat, long dropped) {
 		StringBuilder sb = new StringBuilder(1024);
 		long now = System.currentTimeMillis() / 1000;
+		String name = Settings.getTelemetryName();
+		int timeout = Settings.getTelemetryTimeout();
+		if(name == null || name.trim().isEmpty()) {
+			name = "client-" + Settings.getClientID();
+		}
 
 		sb.append("{");
 		sb.append("\"client_id\":").append(Settings.getClientID()).append(",");
 		sb.append("\"ts\":").append(now);
+		sb.append(",\"name\":\"").append(jsonEscape(name)).append("\"");
+		sb.append(",\"timeout\":").append(timeout);
 
 		if(includeHeartbeat) {
 			sb.append(",\"uptime_s\":").append(Stats.getUptime());
@@ -268,6 +275,8 @@ public class ActivityReporter implements Runnable {
 			conn.setReadTimeout(5000);
 			conn.setDoOutput(true);
 			conn.setRequestProperty("Content-Type", "application/json");
+			conn.setRequestProperty("Accept", "application/json");
+			conn.setRequestProperty("User-Agent", "HathTelemetry/1.0");
 
 			if(authToken != null && authToken.length() > 0) {
 				conn.setRequestProperty("X-Auth-Token", authToken);

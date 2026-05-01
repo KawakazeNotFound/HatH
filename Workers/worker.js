@@ -4,6 +4,21 @@ function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
 }
 
+function getClientIp(request) {
+	const cfIp = request.headers.get("cf-connecting-ip");
+	if(cfIp && cfIp.length > 0) {
+		return cfIp;
+	}
+
+	const xff = request.headers.get("x-forwarded-for");
+	if(xff && xff.length > 0) {
+		return xff.split(",")[0].trim();
+	}
+
+	const realIp = request.headers.get("x-real-ip");
+	return realIp || "unknown";
+}
+
 async function handleIngest(request, env) {
 	if(!env.HATH_DB) {
 		return jsonResponse({ error: "missing_db" }, 500);
@@ -22,17 +37,28 @@ async function handleIngest(request, env) {
 		return jsonResponse({ error: "missing_client_id" }, 400);
 	}
 
+	const clientIp = getClientIp(request);
+
 	const now = Number(body.ts || Math.floor(Date.now() / 1000));
 	const events = Array.isArray(body.events) ? body.events : [];
 
 	if(body.uptime_s !== undefined) {
+		const name = String(body.name || "");
+		let timeout = Number(body.timeout || 0);
+		if(!timeout || timeout < 60) {
+			timeout = 600;
+		}
+		timeout = Math.min(timeout, 43200);
+
 		await env.HATH_DB.prepare(
-			"INSERT INTO clients (client_id, last_seen_ts, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?) " +
-			"ON CONFLICT(client_id) DO UPDATE SET last_seen_ts=excluded.last_seen_ts, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections"
+			"INSERT INTO clients (client_ip, name, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+			"ON CONFLICT(client_ip) DO UPDATE SET name=excluded.name, last_seen_ts=excluded.last_seen_ts, timeout_s=excluded.timeout_s, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections"
 		).bind(
-			clientId,
+			clientIp,
+			name,
 			now,
+			timeout,
 			Number(body.uptime_s || 0),
 			Number(body.files_sent || 0),
 			Number(body.bytes_sent || 0),
@@ -52,16 +78,16 @@ async function handleIngest(request, env) {
 
 			if(fileId.length > 0) {
 				stmts.push(env.HATH_DB.prepare(
-					"INSERT INTO file_stats (fileid, request_count, bytes_sent, last_seen_ts) VALUES (?, 1, ?, ?) " +
-					"ON CONFLICT(fileid) DO UPDATE SET request_count=request_count+1, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=excluded.last_seen_ts"
-				).bind(fileId, bytes, evTs));
+					"INSERT INTO file_stats (client_ip, fileid, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, 1, ?, ?) " +
+					"ON CONFLICT(client_ip, fileid) DO UPDATE SET request_count=request_count+1, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=excluded.last_seen_ts"
+				).bind(clientIp, fileId, bytes, evTs));
 			}
 
 			if(ip.length > 0) {
 				stmts.push(env.HATH_DB.prepare(
-					"INSERT INTO ip_stats (ip, request_count, bytes_sent, last_seen_ts) VALUES (?, 1, ?, ?) " +
-					"ON CONFLICT(ip) DO UPDATE SET request_count=request_count+1, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=excluded.last_seen_ts"
-				).bind(ip, bytes, evTs));
+					"INSERT INTO ip_stats (client_ip, requester_ip, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, 1, ?, ?) " +
+					"ON CONFLICT(client_ip, requester_ip) DO UPDATE SET request_count=request_count+1, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=excluded.last_seen_ts"
+				).bind(clientIp, ip, bytes, evTs));
 			}
 		}
 
@@ -78,16 +104,72 @@ async function handleOverview(env) {
 		return jsonResponse({ error: "missing_db" }, 500);
 	}
 
-	const clientCount = await env.HATH_DB.prepare("SELECT COUNT(*) AS count FROM clients").all();
-	const totalRequests = await env.HATH_DB.prepare("SELECT SUM(request_count) AS total FROM file_stats").all();
-	const topFile = await env.HATH_DB.prepare("SELECT fileid, request_count, bytes_sent FROM file_stats ORDER BY request_count DESC LIMIT 1").all();
-	const topIp = await env.HATH_DB.prepare("SELECT ip, request_count, bytes_sent FROM ip_stats ORDER BY request_count DESC LIMIT 1").all();
+	const now = Math.floor(Date.now() / 1000);
+	const res = await env.HATH_DB.prepare(
+		"SELECT client_ip, name, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections, " +
+		"(SELECT SUM(request_count) FROM file_stats f WHERE f.client_ip = c.client_ip) AS total_requests " +
+		"FROM clients c ORDER BY last_seen_ts DESC"
+	).all();
 
+	const clientsByName = {};
+	let totalRequests = 0;
+	for(const row of (res.results || [])) {
+		const timeout = Math.min(Number(row.timeout_s || 600), 43200);
+		const active = Number(row.last_seen_ts || 0) >= (now - timeout);
+		const clientIp = row.client_ip;
+		let topFile = null;
+		let topIp = null;
+
+		if(clientIp) {
+			const topFileRes = await env.HATH_DB.prepare(
+				"SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 1"
+			).bind(clientIp).all();
+			if(topFileRes.results && topFileRes.results.length > 0) {
+				topFile = topFileRes.results[0];
+			}
+
+			const topIpRes = await env.HATH_DB.prepare(
+				"SELECT requester_ip AS ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 1"
+			).bind(clientIp).all();
+			if(topIpRes.results && topIpRes.results.length > 0) {
+				topIp = topIpRes.results[0];
+			}
+		}
+
+		const name = row.name && row.name.length > 0 ? row.name : "client";
+		let key = name;
+		let suffix = 2;
+		while(Object.prototype.hasOwnProperty.call(clientsByName, key)) {
+			key = name + "#" + suffix;
+			suffix++;
+		}
+
+		const clientEntry = {
+			name: key,
+			last_seen_ts: row.last_seen_ts,
+			timeout_s: timeout,
+			active: active,
+			uptime_s: row.uptime_s || 0,
+			files_sent: row.files_sent || 0,
+			bytes_sent: row.bytes_sent || 0,
+			cache_count: row.cache_count || 0,
+			cache_size: row.cache_size || 0,
+			open_connections: row.open_connections || 0,
+			total_requests: row.total_requests || 0,
+			top_file: topFile,
+			top_ip: topIp
+		};
+
+		clientsByName[key] = clientEntry;
+		totalRequests += clientEntry.total_requests;
+	}
+
+	const activeCount = Object.values(clientsByName).filter((c) => c.active).length;
 	return jsonResponse({
-		client_count: (clientCount.results[0] && clientCount.results[0].count) || 0,
-		total_requests: (totalRequests.results[0] && totalRequests.results[0].total) || 0,
-		top_file: topFile.results[0] || null,
-		top_ip: topIp.results[0] || null
+		client_count: Object.keys(clientsByName).length,
+		active_client_count: activeCount,
+		total_requests: totalRequests,
+		clients: clientsByName
 	});
 }
 
@@ -108,8 +190,17 @@ async function handleTopFiles(request, env) {
 	}
 
 	const url = new URL(request.url);
+	let clientIp = url.searchParams.get("client_ip");
+	const name = url.searchParams.get("name");
+	if(!clientIp && name) {
+		const ipRes = await env.HATH_DB.prepare("SELECT client_ip FROM clients WHERE name = ? ORDER BY last_seen_ts DESC LIMIT 1").bind(name).all();
+		clientIp = ipRes.results && ipRes.results[0] ? ipRes.results[0].client_ip : null;
+	}
+	if(!clientIp) {
+		return jsonResponse({ error: "missing_client" }, 400);
+	}
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
-	const res = await env.HATH_DB.prepare("SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats ORDER BY request_count DESC LIMIT ?").bind(limit).all();
+	const res = await env.HATH_DB.prepare("SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC LIMIT ?").bind(clientIp, limit).all();
 	return jsonResponse({ files: res.results || [] });
 }
 
@@ -119,8 +210,17 @@ async function handleTopIps(request, env) {
 	}
 
 	const url = new URL(request.url);
+	let clientIp = url.searchParams.get("client_ip");
+	const name = url.searchParams.get("name");
+	if(!clientIp && name) {
+		const ipRes = await env.HATH_DB.prepare("SELECT client_ip FROM clients WHERE name = ? ORDER BY last_seen_ts DESC LIMIT 1").bind(name).all();
+		clientIp = ipRes.results && ipRes.results[0] ? ipRes.results[0].client_ip : null;
+	}
+	if(!clientIp) {
+		return jsonResponse({ error: "missing_client" }, 400);
+	}
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
-	const res = await env.HATH_DB.prepare("SELECT ip, request_count, bytes_sent, last_seen_ts FROM ip_stats ORDER BY request_count DESC LIMIT ?").bind(limit).all();
+	const res = await env.HATH_DB.prepare("SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC LIMIT ?").bind(clientIp, limit).all();
 	return jsonResponse({ ips: res.results || [] });
 }
 

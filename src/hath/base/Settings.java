@@ -56,11 +56,11 @@ public class Settings {
 
 	private static short rpcServerPort = 80;
 	private static int clientID = 0, clientPort = 0, throttle_bytes = 0, overrideConns = 0, serverTimeDelta = 0, maxAllowedFileSize = 1073741824, currentStaticRangeCount = 0, maxFilenameLength = 125, imageProxyPort = 0;
-	private static int telemetryBatchSize = 200, telemetryFlushInterval = 30, telemetryMaxQueue = 2000, telemetryHeartbeatInterval = 60;
+	private static int telemetryBatchSize = 200, telemetryFlushInterval = 30, telemetryMaxQueue = 2000, telemetryHeartbeatInterval = 60, telemetryTimeout = 600;
 	private static long disklimit_bytes = 0, diskremaining_bytes = 0, fileSystemBlocksize = 4096;
 	private static boolean verifyCache = false, rescanCache = false, skipFreeSpaceCheck = false, warnNewClient = false, useLessMemory = false, disableBWM = false, disableDownloadBWM = false, disableFileVerification = false, disableLogs = false, flushLogs = false, disableIPOriginCheck = false, disableFloodControl = false;
 	private static boolean telemetryEnabled = false;
-	private static String telemetryEndpoint = null, telemetryToken = "";
+	private static String telemetryEndpoint = null, telemetryToken = "", telemetryName = null;
 
 	public static void setActiveClient(HentaiAtHomeClient client) {
 		activeClient = client;
@@ -362,6 +362,9 @@ public class Settings {
 			else if(setting.equals("telemetry_token")) {
 				telemetryToken = value;
 			}
+			else if(setting.equals("name")) {
+				telemetryName = value;
+			}
 			else if(setting.equals("telemetry_batch_size")) {
 				telemetryBatchSize = Math.max(1, Integer.parseInt(value));
 			}
@@ -373,6 +376,9 @@ public class Settings {
 			}
 			else if(setting.equals("telemetry_heartbeat_interval")) {
 				telemetryHeartbeatInterval = Math.max(5, Integer.parseInt(value));
+			}
+			else if(setting.equals("telemetry_timeout")) {
+				telemetryTimeout = Math.max(60, Integer.parseInt(value));
 			}
 			else if(!setting.equals("silentstart")) {
 				// don't flag errors if the setting is handled by the GUI
@@ -557,6 +563,14 @@ public class Settings {
 
 	public static int getTelemetryHeartbeatInterval() {
 		return telemetryHeartbeatInterval;
+	}
+
+	public static int getTelemetryTimeout() {
+		return telemetryTimeout;
+	}
+
+	public static String getTelemetryName() {
+		return telemetryName;
 	}
 	
 	public static boolean isImageProxyEnabled() {
