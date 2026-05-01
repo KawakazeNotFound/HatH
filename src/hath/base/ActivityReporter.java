@@ -82,6 +82,7 @@ public class ActivityReporter implements Runnable {
 					Settings.getTelemetryFlushInterval(),
 					Settings.getTelemetryHeartbeatInterval()
 			);
+			Out.info("ActivityReporter: Enabled endpoint=" + endpoint.trim() + " heartbeat=" + Settings.getTelemetryHeartbeatInterval() + "s flush=" + Settings.getTelemetryFlushInterval() + "s batch=" + Settings.getTelemetryBatchSize() + " queue=" + Settings.getTelemetryMaxQueue());
 			instance.start();
 		}
 	}
@@ -192,6 +193,9 @@ public class ActivityReporter implements Runnable {
 		}
 
 		if(postJson(payload)) {
+			if(includeHeartbeat || force) {
+				Out.info("ActivityReporter: Posted telemetry events=" + snapshot.size() + " dropped=" + droppedSnapshot + " heartbeat=" + includeHeartbeat);
+			}
 			long now = System.currentTimeMillis();
 			lastFlush = now;
 			if(includeHeartbeat) {
@@ -205,6 +209,9 @@ public class ActivityReporter implements Runnable {
 				}
 				droppedEvents = 0;
 			}
+		}
+		else {
+			Out.warning("ActivityReporter: Telemetry post failed events=" + snapshot.size() + " dropped=" + droppedSnapshot + " heartbeat=" + includeHeartbeat);
 		}
 	}
 
@@ -275,6 +282,9 @@ public class ActivityReporter implements Runnable {
 			os.close();
 
 			int code = conn.getResponseCode();
+			if(code < 200 || code >= 300) {
+				Out.warning("ActivityReporter: Telemetry endpoint returned HTTP " + code);
+			}
 			return code >= 200 && code < 300;
 		}
 		catch(Exception e) {

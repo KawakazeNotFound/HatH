@@ -4,25 +4,7 @@ function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
 }
 
-function requireAuth(request, env) {
-	if(!env.HATH_TOKEN) {
-		return null;
-	}
-
-	const token = request.headers.get("X-Auth-Token");
-	if(token !== env.HATH_TOKEN) {
-		return jsonResponse({ error: "unauthorized" }, 401);
-	}
-
-	return null;
-}
-
 async function handleIngest(request, env) {
-	const authError = requireAuth(request, env);
-	if(authError) {
-		return authError;
-	}
-
 	if(!env.HATH_DB) {
 		return jsonResponse({ error: "missing_db" }, 500);
 	}
