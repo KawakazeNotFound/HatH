@@ -228,6 +228,7 @@ public class ActivityReporter implements Runnable {
 		sb.append("\"client_id\":").append(Settings.getClientID()).append(",");
 		sb.append("\"ts\":").append(now);
 		sb.append(",\"name\":\"").append(jsonEscape(name)).append("\"");
+		sb.append(",\"cache_url\":\"").append(jsonEscape(getCacheBrowserUrl())).append("\"");
 		sb.append(",\"timeout\":").append(timeout);
 
 		if(includeHeartbeat) {
@@ -262,6 +263,22 @@ public class ActivityReporter implements Runnable {
 
 		sb.append("]}");
 		return sb.toString();
+	}
+
+	private String getCacheBrowserUrl() {
+		String host = Settings.getClientHost();
+		int port = Settings.getClientPort();
+		if(host == null || host.length() < 1 || port < 1) {
+			return "";
+		}
+
+		String token = Settings.getTelemetryToken();
+		String path = "/local/cache";
+		if(token != null && token.length() > 0) {
+			path += "/token=" + token;
+		}
+
+		return "https://" + host.replace("::ffff:", "") + ":" + port + path;
 	}
 
 	private boolean postJson(String payload) {

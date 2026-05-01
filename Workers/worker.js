@@ -1,7 +1,12 @@
 const JSON_HEADERS = {"Content-Type": "application/json"};
+const HTML_HEADERS = {"Content-Type": "text/html; charset=utf-8"};
 
 function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
+}
+
+function htmlResponse(body, status) {
+	return new Response(body, { status: status || 200, headers: HTML_HEADERS });
 }
 
 function extractToken(request) {
@@ -31,6 +36,145 @@ function requireAuth(request, env, envKey, allowQueryToken) {
 	}
 
 	return null;
+}
+
+function getTzOffsetSeconds(url) {
+	const tz = url.searchParams.get("tz");
+	if(!tz) {
+		return 0;
+	}
+
+	const num = Number(tz);
+	if(Number.isNaN(num)) {
+		return 0;
+	}
+
+	if(Math.abs(num) <= 24) {
+		return Math.trunc(num * 3600);
+	}
+
+	const minutes = Math.max(-1440, Math.min(1440, Math.trunc(num)));
+	return minutes * 60;
+}
+
+function pad2(value) {
+	return value < 10 ? "0" + value : "" + value;
+}
+
+function formatTimestamp(ts, tzOffsetSeconds) {
+	if(!ts) {
+		return null;
+	}
+
+	const date = new Date((ts + tzOffsetSeconds) * 1000);
+	const yyyy = date.getUTCFullYear();
+	const mm = pad2(date.getUTCMonth() + 1);
+	const dd = pad2(date.getUTCDate());
+	const hh = pad2(date.getUTCHours());
+	const mi = pad2(date.getUTCMinutes());
+	const ss = pad2(date.getUTCSeconds());
+
+	const offsetMinutes = Math.trunc(tzOffsetSeconds / 60);
+	const sign = offsetMinutes >= 0 ? "+" : "-";
+	const absMinutes = Math.abs(offsetMinutes);
+	const offH = pad2(Math.floor(absMinutes / 60));
+	const offM = pad2(absMinutes % 60);
+	return yyyy + "-" + mm + "-" + dd + " " + hh + ":" + mi + ":" + ss + " UTC" + sign + offH + ":" + offM;
+}
+
+function getFileExtension(type) {
+	if(type === "wbp") {
+		return "webp";
+	}
+
+	if(type === "wbm") {
+		return "webm";
+	}
+
+	if(type === "avf") {
+		return "avif";
+	}
+
+	return type || "";
+}
+
+function getMimeType(type) {
+	switch(type) {
+		case "jpg": return "image/jpeg";
+		case "png": return "image/png";
+		case "gif": return "image/gif";
+		case "mp4": return "video/mp4";
+		case "wbm": return "video/webm";
+		case "wbp": return "image/webp";
+		case "avf": return "image/avif";
+		case "jxl": return "image/jxl";
+		default: return "application/octet-stream";
+	}
+}
+
+function addFileMetadata(row) {
+	const match = String(row.fileid || "").match(/^([a-f0-9]{40})-\d+(?:-\d+-\d+)?-(jpg|png|gif|mp4|wbm|wbp|avf|jxl)$/);
+	if(!match) {
+		row.display_name = row.fileid;
+		row.extension = "";
+		row.mime = "application/octet-stream";
+		return row;
+	}
+
+	row.extension = getFileExtension(match[2]);
+	row.mime = getMimeType(match[2]);
+	row.display_name = match[1] + "." + row.extension;
+	return row;
+}
+
+function getReadTokenParam(request) {
+	const url = new URL(request.url);
+	const token = url.searchParams.get("token");
+	return token ? "&token=" + encodeURIComponent(token) : "";
+}
+
+function jsString(value) {
+	return JSON.stringify(String(value || ""));
+}
+
+function parseCacheUrl(cacheUrl) {
+	if(!cacheUrl) {
+		return null;
+	}
+
+	try {
+		const url = new URL(cacheUrl);
+		let token = "";
+		for(const part of url.pathname.split("/")) {
+			if(part.startsWith("token=")) {
+				token = part.substring(6);
+			}
+		}
+
+		return {
+			origin: url.origin,
+			token: token
+		};
+	}
+	catch(e) {
+		return null;
+	}
+}
+
+function buildClientPath(cacheRef, action, params) {
+	const parts = [cacheRef.origin, "local", "cache"];
+	if(action) {
+		parts.push(action);
+	}
+	if(params) {
+		parts.push(params);
+	}
+
+	let url = parts.join("/");
+	if(cacheRef.token) {
+		url += (action === "list" && params ? ";" : "/") + "token=" + cacheRef.token;
+	}
+	return url;
 }
 
 function getClientIp(request) {
@@ -73,6 +217,7 @@ async function handleIngest(request, env) {
 
 	if(body.uptime_s !== undefined) {
 		const name = String(body.name || "");
+		const cacheUrl = String(body.cache_url || "");
 		let timeout = Number(body.timeout || 0);
 		if(!timeout || timeout < 60) {
 			timeout = 600;
@@ -80,12 +225,13 @@ async function handleIngest(request, env) {
 		timeout = Math.min(timeout, 43200);
 
 		await env.HATH_DB.prepare(
-			"INSERT INTO clients (client_ip, name, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
-			"ON CONFLICT(client_ip) DO UPDATE SET name=excluded.name, last_seen_ts=excluded.last_seen_ts, timeout_s=excluded.timeout_s, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections"
+			"INSERT INTO clients (client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
+			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+			"ON CONFLICT(client_ip) DO UPDATE SET name=excluded.name, cache_url=CASE WHEN excluded.cache_url != '' THEN excluded.cache_url ELSE clients.cache_url END, last_seen_ts=excluded.last_seen_ts, timeout_s=excluded.timeout_s, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections"
 		).bind(
 			clientIp,
 			name,
+			cacheUrl,
 			now,
 			timeout,
 			Number(body.uptime_s || 0),
@@ -128,14 +274,15 @@ async function handleIngest(request, env) {
 	return jsonResponse({ ok: true, events: events.length });
 }
 
-async function handleOverview(env) {
+async function handleOverview(request, env) {
 	if(!env.HATH_DB) {
 		return jsonResponse({ error: "missing_db" }, 500);
 	}
 
 	const now = Math.floor(Date.now() / 1000);
+	const tzOffsetSeconds = getTzOffsetSeconds(new URL(request.url));
 	const res = await env.HATH_DB.prepare(
-		"SELECT client_ip, name, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections, " +
+		"SELECT client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections, " +
 		"(SELECT SUM(request_count) FROM file_stats f WHERE f.client_ip = c.client_ip) AS total_requests " +
 		"FROM clients c ORDER BY last_seen_ts DESC"
 	).all();
@@ -155,6 +302,8 @@ async function handleOverview(env) {
 			).bind(clientIp).all();
 			if(topFileRes.results && topFileRes.results.length > 0) {
 				topFile = topFileRes.results[0];
+				addFileMetadata(topFile);
+				topFile.last_seen = formatTimestamp(topFile.last_seen_ts, tzOffsetSeconds);
 			}
 
 			const topIpRes = await env.HATH_DB.prepare(
@@ -162,6 +311,7 @@ async function handleOverview(env) {
 			).bind(clientIp).all();
 			if(topIpRes.results && topIpRes.results.length > 0) {
 				topIp = topIpRes.results[0];
+				topIp.last_seen = formatTimestamp(topIp.last_seen_ts, tzOffsetSeconds);
 			}
 		}
 
@@ -175,7 +325,9 @@ async function handleOverview(env) {
 
 		const clientEntry = {
 			name: key,
+			cache_url: row.cache_url || null,
 			last_seen_ts: row.last_seen_ts,
+			last_seen: formatTimestamp(row.last_seen_ts, tzOffsetSeconds),
 			timeout_s: timeout,
 			active: active,
 			uptime_s: row.uptime_s || 0,
@@ -208,9 +360,14 @@ async function handleClients(request, env) {
 	}
 
 	const url = new URL(request.url);
+	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	const limit = Math.min(Number(url.searchParams.get("limit") || 200), 1000);
 	const res = await env.HATH_DB.prepare("SELECT * FROM clients ORDER BY last_seen_ts DESC LIMIT ?").bind(limit).all();
-	return jsonResponse({ clients: res.results || [] });
+	const clients = (res.results || []).map((row) => {
+		row.last_seen = formatTimestamp(row.last_seen_ts, tzOffsetSeconds);
+		return row;
+	});
+	return jsonResponse({ clients: clients });
 }
 
 async function handleTopFiles(request, env) {
@@ -219,6 +376,7 @@ async function handleTopFiles(request, env) {
 	}
 
 	const url = new URL(request.url);
+	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	let clientIp = url.searchParams.get("client_ip");
 	const name = url.searchParams.get("name");
 	if(!clientIp && name) {
@@ -230,7 +388,12 @@ async function handleTopFiles(request, env) {
 	}
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
 	const res = await env.HATH_DB.prepare("SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC LIMIT ?").bind(clientIp, limit).all();
-	return jsonResponse({ files: res.results || [] });
+	const files = (res.results || []).map((row) => {
+		addFileMetadata(row);
+		row.last_seen = formatTimestamp(row.last_seen_ts, tzOffsetSeconds);
+		return row;
+	});
+	return jsonResponse({ files: files });
 }
 
 async function handleTopIps(request, env) {
@@ -239,6 +402,7 @@ async function handleTopIps(request, env) {
 	}
 
 	const url = new URL(request.url);
+	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	let clientIp = url.searchParams.get("client_ip");
 	const name = url.searchParams.get("name");
 	if(!clientIp && name) {
@@ -250,12 +414,171 @@ async function handleTopIps(request, env) {
 	}
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
 	const res = await env.HATH_DB.prepare("SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC LIMIT ?").bind(clientIp, limit).all();
-	return jsonResponse({ ips: res.results || [] });
+	const ips = (res.results || []).map((row) => {
+		row.last_seen = formatTimestamp(row.last_seen_ts, tzOffsetSeconds);
+		return row;
+	});
+	return jsonResponse({ ips: ips });
+}
+
+async function resolveClient(request, env) {
+	const url = new URL(request.url);
+	const clientIp = url.searchParams.get("client_ip");
+	const name = url.searchParams.get("name");
+
+	if(clientIp) {
+		const res = await env.HATH_DB.prepare("SELECT client_ip, name, cache_url FROM clients WHERE client_ip = ? LIMIT 1").bind(clientIp).all();
+		return res.results && res.results[0] ? res.results[0] : null;
+	}
+
+	if(name) {
+		const res = await env.HATH_DB.prepare("SELECT client_ip, name, cache_url FROM clients WHERE name = ? ORDER BY last_seen_ts DESC LIMIT 1").bind(name).all();
+		return res.results && res.results[0] ? res.results[0] : null;
+	}
+
+	const res = await env.HATH_DB.prepare("SELECT client_ip, name, cache_url FROM clients WHERE cache_url IS NOT NULL AND cache_url != '' ORDER BY last_seen_ts DESC LIMIT 1").all();
+	return res.results && res.results[0] ? res.results[0] : null;
+}
+
+async function handleCacheTree(request, env) {
+	if(!env.HATH_DB) {
+		return jsonResponse({ error: "missing_db" }, 500);
+	}
+
+	const url = new URL(request.url);
+	const client = await resolveClient(request, env);
+	if(!client) {
+		return jsonResponse({ error: "missing_client" }, 400);
+	}
+
+	const cacheRef = parseCacheUrl(client.cache_url);
+	if(!cacheRef) {
+		return jsonResponse({ error: "missing_cache_url" }, 400);
+	}
+
+	const prefix = String(url.searchParams.get("prefix") || "").toLowerCase();
+	if(!/^[a-f0-9]{0,40}$/.test(prefix)) {
+		return jsonResponse({ error: "invalid_prefix" }, 400);
+	}
+
+	const limit = Math.min(Number(url.searchParams.get("limit") || 500), 1000);
+	const offset = Math.max(Number(url.searchParams.get("offset") || 0), 0);
+	const clientUrl = buildClientPath(cacheRef, "list", "prefix=" + prefix + ";limit=" + limit + ";offset=" + offset);
+	const upstream = await fetch(clientUrl, { headers: { "Accept": "application/json" } });
+	if(!upstream.ok) {
+		return jsonResponse({ error: "client_fetch_failed", status: upstream.status }, 502);
+	}
+
+	const data = await upstream.json();
+	for(const item of (data.items || [])) {
+		if(item.type === "file") {
+			addFileMetadata(item);
+		}
+	}
+	data.client = { name: client.name, client_ip: client.client_ip };
+	return jsonResponse(data);
+}
+
+async function handleCacheFile(request, env) {
+	if(!env.HATH_DB) {
+		return jsonResponse({ error: "missing_db" }, 500);
+	}
+
+	const url = new URL(request.url);
+	const fileId = String(url.searchParams.get("fileid") || "");
+	if(!/^([a-f0-9]{40})-\d+(?:-\d+-\d+)?-(jpg|png|gif|mp4|wbm|wbp|avf|jxl)$/.test(fileId)) {
+		return jsonResponse({ error: "invalid_fileid" }, 400);
+	}
+
+	const client = await resolveClient(request, env);
+	if(!client) {
+		return jsonResponse({ error: "missing_client" }, 400);
+	}
+
+	const cacheRef = parseCacheUrl(client.cache_url);
+	if(!cacheRef) {
+		return jsonResponse({ error: "missing_cache_url" }, 400);
+	}
+
+	const clientUrl = buildClientPath(cacheRef, "file", fileId);
+	const upstream = await fetch(clientUrl);
+	if(!upstream.ok) {
+		return jsonResponse({ error: "client_fetch_failed", status: upstream.status }, 502);
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", upstream.headers.get("Content-Type") || getMimeType(fileId.split("-").pop()));
+	headers.set("Cache-Control", "private, max-age=60");
+	headers.set("Content-Disposition", "inline");
+	const length = upstream.headers.get("Content-Length");
+	if(length) {
+		headers.set("Content-Length", length);
+	}
+	return new Response(upstream.body, { status: 200, headers: headers });
+}
+
+function getCacheBrowserHtml(request) {
+	const url = new URL(request.url);
+	const tokenParam = getReadTokenParam(request);
+	const initialName = url.searchParams.get("name") || "";
+	return `<!doctype html>
+<html><head><meta charset="utf-8"><title>H@H Cache Browser</title>
+<style>
+:root{color-scheme:dark;--bg:#232323;--fg:#eee;--muted:#93a19b;--title:#9bd48f;--bar:#443f3f;--link:#f0e6c8;--tag:#6aa5a4;--size:#92be82;--line:#343434}
+body.light{color-scheme:light;--bg:#f6f4ef;--fg:#252525;--muted:#66736e;--title:#367c45;--bar:#ddd8d0;--link:#29323a;--tag:#6ba6a6;--size:#79a96d;--line:#ded8cd}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:Arial,Helvetica,sans-serif;font-size:15px}.wrap{max-width:980px;margin:42px auto 28px;padding:0 28px}h1{margin:0 0 22px;color:var(--title);font-size:46px;font-weight:300}.bar{display:flex;gap:22px;align-items:center;flex-wrap:wrap;background:var(--bar);border-radius:8px;padding:13px 18px;margin-bottom:18px}select,input[type=text]{background:transparent;color:var(--fg);border:1px solid var(--muted);border-radius:4px;padding:4px 8px}button{background:transparent;color:var(--link);border:1px solid var(--muted);border-radius:4px;padding:4px 9px;cursor:pointer}.path{color:var(--muted);margin-left:auto}.path code{color:var(--link)}.entry{display:grid;grid-template-columns:34px minmax(0,1fr) auto auto auto;gap:10px;align-items:center;min-height:42px}.entry:hover{background:rgba(255,255,255,.04)}body.light .entry:hover{background:rgba(0,0,0,.04)}a{color:var(--link);text-decoration:none}.name{overflow-wrap:anywhere}.sub{display:block;margin-top:2px;color:var(--muted);font-size:12px}.pill{display:inline-block;border-radius:4px;padding:3px 7px;color:#fff;background:var(--tag);font-size:12px}.bytes{background:var(--size)}.icon{position:relative;width:25px;height:23px;display:inline-block}.folder:before{content:'';position:absolute;left:1px;top:7px;width:23px;height:14px;border:2px solid #77a7bc;border-radius:2px}.folder:after{content:'';position:absolute;left:3px;top:3px;width:10px;height:6px;border:2px solid #77a7bc;border-bottom:0}.file:before{content:'';position:absolute;left:5px;top:1px;width:15px;height:21px;border:2px solid #8db3c2}.file:after{content:'';position:absolute;left:9px;top:7px;width:8px;height:2px;background:#8db3c2;box-shadow:0 5px 0 #8db3c2,0 10px 0 #8db3c2}.up{font-size:28px;color:#75a2b6}.preview{margin-top:28px;padding-top:20px;border-top:1px solid var(--line)}.preview img,.preview video{display:block;max-width:100%;max-height:72vh;background:#000;border-radius:4px}.caption{color:var(--muted);margin-bottom:10px}.footer{margin-top:34px;text-align:center;color:var(--muted);font-size:12px}@media(max-width:640px){.wrap{margin-top:24px;padding:0 16px}h1{font-size:36px}.entry{grid-template-columns:30px minmax(0,1fr)}.entry .pill,.entry .age{display:none}.path{width:100%;margin-left:0}}
+</style></head><body><main class="wrap"><h1>File Browser</h1>
+<section class="bar">
+<label>client: <select id="client"></select></label>
+<label>sort list by: <input type="radio" name="sort" value="date" checked onchange="renderList()"> date <input type="radio" name="sort" value="name" onchange="renderList()"> name <input type="radio" name="sort" value="size" onchange="renderList()"> size</label>
+<label>theme: <input type="radio" name="theme" value="light" onchange="setTheme(this.value)"> light <input type="radio" name="theme" value="dark" checked onchange="setTheme(this.value)"> dark</label>
+<label>prefix: <input id="prefix" type="text" placeholder="e03c"></label><button onclick="goPrefix()">open</button><span class="path">/cache/<code id="path"></code></span>
+</section><section id="list"></section><section id="preview" class="preview"></section><div class="footer">H@H cache browser via Worker</div></main>
+<script>
+const auth='${tokenParam}';const initialName=${jsString(initialName)};let currentPrefix='',currentItems=[],nextOffset=null,offset=0;const limit=500;
+function qs(){const c=document.getElementById('client').value;return 'name='+encodeURIComponent(c)+auth;}
+function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+function size(n){n=Number(n||0);const u=['bytes','KB','MB','GB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i===0?Math.round(n):n.toFixed(2))+' '+u[i];}
+function age(ts){if(!ts)return '';let s=Math.max(1,Math.floor(Date.now()/1000-ts));for(const [n,v] of [['year',31536000],['month',2592000],['day',86400],['hour',3600],['minute',60]]){if(s>=v){const x=Math.floor(s/v);return x+' '+n+(x>1?'s':'')+' ago';}}return 'seconds ago';}
+function sortMode(){return document.querySelector('input[name=sort]:checked')?.value||'date';}
+function setTheme(v){document.body.className=v==='light'?'light':'';}
+function parentPrefix(){if(currentPrefix.length>=4)return currentPrefix.substring(0,2);if(currentPrefix.length>=2)return '';return null;}
+function goPrefix(){openPrefix(document.getElementById('prefix').value.trim().toLowerCase());}
+async function loadClients(){const res=await fetch('/v1/clients?'+auth.substring(1));const data=await res.json();const sel=document.getElementById('client');sel.innerHTML='';for(const c of data.clients||[]){const o=document.createElement('option');o.value=c.name||c.client_ip;o.textContent=(c.name||c.client_ip)+(c.cache_url?'':' (no cache url)');sel.appendChild(o);}if(initialName){sel.value=initialName;}sel.onchange=()=>openPrefix('');if(sel.value){await openPrefix('');}else{document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>No clients found.</span><span></span><span></span><span></span></div>';}}
+async function openPrefix(prefix,append){if(!append){offset=0;currentItems=[];}currentPrefix=prefix||'';document.getElementById('prefix').value=currentPrefix;document.getElementById('path').textContent=currentPrefix?currentPrefix.match(/.{1,2}/g).join('/')+'/':'';const res=await fetch('/v1/cache/tree?'+qs()+'&prefix='+currentPrefix+'&limit='+limit+'&offset='+offset);const data=await res.json();if(data.error){document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>'+esc(data.error)+'</span><span></span><span></span><span></span></div>';return;}currentItems=currentItems.concat(data.items||[]);nextOffset=data.next_offset;renderList();}
+function renderList(){const list=document.getElementById('list');let items=currentItems.slice();const mode=sortMode();items.sort((a,b)=>a.type!==b.type?a.type==='dir'?-1:1:mode==='size'?(b.size||0)-(a.size||0):mode==='date'?(b.last_modified||0)-(a.last_modified||0):String(a.name||a.display_name||a.fileid).localeCompare(String(b.name||b.display_name||b.fileid)));let html='';const parent=parentPrefix();if(parent!==null){html+='<div class=entry><span class=up>&#8634;</span><a class=name href=# onclick="openPrefix(\\''+parent+'\\');return false;">..</a><span></span><span></span><span></span></div>';}for(const item of items){if(item.type==='dir'){html+='<div class=entry><span class="icon folder"></span><a class=name href=# onclick="openPrefix(\\''+esc(item.prefix)+'\\');return false;">'+esc(item.name)+'</a><span class=pill>folder</span><span></span><span></span></div>';}else{html+='<div class=entry><span class="icon file"></span><a class=name href=# onclick="preview(\\''+esc(item.fileid)+'\\',\\''+esc(item.mime)+'\\');return false;">'+esc(item.display_name||item.fileid)+'<span class=sub>'+esc(item.fileid)+'</span></a><span class=pill>'+esc(item.extension||item.mime)+'</span><span class="pill bytes">'+size(item.size)+'</span><span class="sub age">'+age(item.last_modified)+'</span></div>';}}if(nextOffset!==null){html+='<div style="margin-top:16px"><button onclick="offset=nextOffset;openPrefix(currentPrefix,true)">load more</button></div>';}list.innerHTML=html;}
+function preview(fileid,mime){const url='/v1/cache/file?'+qs()+'&fileid='+encodeURIComponent(fileid);const box=document.getElementById('preview');const cap='<div class=caption>'+esc(fileid)+'</div>';box.innerHTML=mime.startsWith('video/')?cap+'<video controls src="'+url+'"></video>':cap+'<img src="'+url+'" />';box.scrollIntoView({block:'nearest'});}
+loadClients();
+</script></body></html>`;
 }
 
 export default {
 	async fetch(request, env) {
 		const url = new URL(request.url);
+
+		if(request.method === "GET" && (url.pathname === "/cache" || url.pathname === "/v1/cache" || url.pathname === "/v1/cache/browser")) {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return htmlResponse(getCacheBrowserHtml(request));
+		}
+
+		if(request.method === "GET" && url.pathname === "/v1/cache/tree") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return handleCacheTree(request, env);
+		}
+
+		if(request.method === "GET" && url.pathname === "/v1/cache/file") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return handleCacheFile(request, env);
+		}
 
 		if(request.method === "POST" && url.pathname === "/v1/ingest") {
 			const authError = requireAuth(request, env, "HATH_INGEST_TOKEN", false);
@@ -270,7 +593,7 @@ export default {
 			if(authError) {
 				return authError;
 			}
-			return handleOverview(env);
+			return handleOverview(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/clients") {
@@ -281,7 +604,7 @@ export default {
 			return handleClients(request, env);
 		}
 
-		if(request.method === "GET" && url.pathname === "/v1/top/files") {
+		if(request.method === "GET" && (url.pathname === "/v1/top/files" || url.pathname === "/v1/cache/files")) {
 			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
 			if(authError) {
 				return authError;

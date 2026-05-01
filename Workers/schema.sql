@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS clients (
 	client_ip TEXT PRIMARY KEY,
 	name TEXT,
+	cache_url TEXT,
 	last_seen_ts INTEGER,
 	timeout_s INTEGER,
 	uptime_s INTEGER,

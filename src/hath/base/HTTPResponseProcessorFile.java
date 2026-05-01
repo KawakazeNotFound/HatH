@@ -39,11 +39,17 @@ public class HTTPResponseProcessorFile extends HTTPResponseProcessor {
 	private MessageDigest sha1Digest = null;
 	private int readoff = 0;
 	private boolean verifyFileIntegrity = false;
+	private boolean countStats = true;
 
 	public HTTPResponseProcessorFile(HTTPSession session, HVFile requestedHVFile, boolean verifyFileIntegrity) {
+		this(session, requestedHVFile, verifyFileIntegrity, true);
+	}
+
+	public HTTPResponseProcessorFile(HTTPSession session, HVFile requestedHVFile, boolean verifyFileIntegrity, boolean countStats) {
 		this.session = session;
 		this.requestedHVFile = requestedHVFile;
 		this.verifyFileIntegrity = verifyFileIntegrity;
+		this.countStats = countStats;
 	}
 
 	public int initialize() {
@@ -65,7 +71,9 @@ public class HTTPResponseProcessorFile extends HTTPResponseProcessor {
 			fileChannel.read(fileBuffer);
 			fileBuffer.flip();
 			responseStatusCode = 200;
-			Stats.fileSent();
+			if(countStats) {
+				Stats.fileSent();
+			}
 		}
 		catch(java.io.IOException e) {
 			Out.warning("Failed reading content from " + requestedHVFile.getLocalFilePath());
