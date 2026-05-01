@@ -4,6 +4,35 @@ function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
 }
 
+function extractToken(request) {
+	const auth = request.headers.get("Authorization");
+	if(auth && auth.startsWith("Bearer ")) {
+		return auth.substring(7);
+	}
+
+	const headerToken = request.headers.get("X-Auth-Token");
+	return headerToken || null;
+}
+
+function requireAuth(request, env, envKey, allowQueryToken) {
+	const required = env[envKey];
+	if(!required) {
+		return null;
+	}
+
+	let token = extractToken(request);
+	if(!token && allowQueryToken) {
+		const url = new URL(request.url);
+		token = url.searchParams.get("token");
+	}
+
+	if(token !== required) {
+		return jsonResponse({ error: "unauthorized" }, 401);
+	}
+
+	return null;
+}
+
 function getClientIp(request) {
 	const cfIp = request.headers.get("cf-connecting-ip");
 	if(cfIp && cfIp.length > 0) {
@@ -229,22 +258,42 @@ export default {
 		const url = new URL(request.url);
 
 		if(request.method === "POST" && url.pathname === "/v1/ingest") {
+			const authError = requireAuth(request, env, "HATH_INGEST_TOKEN", false);
+			if(authError) {
+				return authError;
+			}
 			return handleIngest(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/overview") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
 			return handleOverview(env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/clients") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
 			return handleClients(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/top/files") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
 			return handleTopFiles(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/top/ips") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
 			return handleTopIps(request, env);
 		}
 
