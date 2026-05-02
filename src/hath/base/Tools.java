@@ -29,6 +29,7 @@ import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.OutputStreamWriter;
+import java.net.URLDecoder;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
@@ -96,7 +97,7 @@ public class Tools {
 						String[] kvPairParts = kvPair.trim().split("=", 2);
 
 						if(kvPairParts.length == 2) {
-							addTable.put(kvPairParts[0].trim(), kvPairParts[1].trim());
+							addTable.put(urlDecode(kvPairParts[0].trim()), urlDecode(kvPairParts[1].trim()));
 						}
 						else {
 							Out.warning("Invalid kvPair: " + kvPair);
@@ -107,6 +108,15 @@ public class Tools {
 		}
 
 		return addTable;
+	}
+
+	private static String urlDecode(String s) {
+		try {
+			return URLDecoder.decode(s, "UTF-8");
+		}
+		catch(Exception e) {
+			return s;
+		}
 	}
 
 	public static String getSHA1String(String stringToHash) {

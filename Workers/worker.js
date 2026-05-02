@@ -1,5 +1,9 @@
 const JSON_HEADERS = {"Content-Type": "application/json"};
 const HTML_HEADERS = {"Content-Type": "text/html; charset=utf-8"};
+const STATS_FLUSH_INTERVAL_S = 3600;
+const D1_BATCH_SIZE = 50;
+const DO_CHECKPOINT_INTERVAL_S = 60;
+const DO_CHECKPOINT_EVENT_LIMIT = 1000;
 
 function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
@@ -192,86 +196,201 @@ function getClientIp(request) {
 	return realIp || "unknown";
 }
 
+function requireStatsDo(env) {
+	return env.HATH_STATS ? null : jsonResponse({ error: "missing_durable_object" }, 500);
+}
+
+function getStatsDo(env) {
+	const id = env.HATH_STATS.idFromName("global");
+	return env.HATH_STATS.get(id);
+}
+
+function getInternalStatsRequest(request, path, clientIp) {
+	const inputUrl = new URL(request.url);
+	const url = new URL("https://hath.internal" + path);
+	url.search = inputUrl.search;
+
+	const headers = new Headers(request.headers);
+	headers.set("X-Hath-Client-IP", clientIp);
+	return new Request(url.toString(), {
+		method: request.method,
+		headers: headers,
+		body: request.body
+	});
+}
+
+async function forwardToStatsDo(request, env, path) {
+	const error = requireStatsDo(env);
+	if(error) {
+		return error;
+	}
+
+	const stub = getStatsDo(env);
+	return stub.fetch(getInternalStatsRequest(request, path, getClientIp(request)));
+}
+
+function getHourBucket(ts) {
+	return Math.floor(Number(ts || 0) / STATS_FLUSH_INTERVAL_S) * STATS_FLUSH_INTERVAL_S;
+}
+
+function addAggRow(map, key, bytes, ts) {
+	if(!key) {
+		return;
+	}
+
+	const current = map[key] || { request_count: 0, bytes_sent: 0, last_seen_ts: 0 };
+	current.request_count += 1;
+	current.bytes_sent += Number(bytes || 0);
+	current.last_seen_ts = Math.max(Number(current.last_seen_ts || 0), Number(ts || 0));
+	map[key] = current;
+}
+
+function bindStatStatement(env, table, clientIp, key, row) {
+	if(table === "file") {
+		return env.HATH_DB.prepare(
+			"INSERT INTO file_stats (client_ip, fileid, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, ?, ?, ?) " +
+			"ON CONFLICT(client_ip, fileid) DO UPDATE SET request_count=request_count+excluded.request_count, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=MAX(file_stats.last_seen_ts, excluded.last_seen_ts)"
+		).bind(clientIp, key, row.request_count, row.bytes_sent, row.last_seen_ts);
+	}
+
+	return env.HATH_DB.prepare(
+		"INSERT INTO ip_stats (client_ip, requester_ip, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, ?, ?, ?) " +
+		"ON CONFLICT(client_ip, requester_ip) DO UPDATE SET request_count=request_count+excluded.request_count, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=MAX(ip_stats.last_seen_ts, excluded.last_seen_ts)"
+	).bind(clientIp, key, row.request_count, row.bytes_sent, row.last_seen_ts);
+}
+
+async function flushStatsAggregate(env, clientIp, aggregate) {
+	if(!aggregate || !aggregate.client_ip) {
+		return 0;
+	}
+
+	const stmts = [];
+	for(const fileId of Object.keys(aggregate.files || {})) {
+		stmts.push(bindStatStatement(env, "file", clientIp, fileId, aggregate.files[fileId]));
+	}
+
+	for(const ip of Object.keys(aggregate.ips || {})) {
+		stmts.push(bindStatStatement(env, "ip", clientIp, ip, aggregate.ips[ip]));
+	}
+
+	for(let i = 0; i < stmts.length; i += D1_BATCH_SIZE) {
+		await env.HATH_DB.batch(stmts.slice(i, i + D1_BATCH_SIZE));
+	}
+
+	return stmts.length;
+}
+
+async function queueStatsAggregate(env, stats, clientIp, events, now) {
+	const currentBucket = getHourBucket(now);
+	let aggregate = stats.get(clientIp);
+	let flushed = 0;
+
+	if(aggregate && Number(aggregate.bucket_start_ts || 0) < currentBucket) {
+		flushed = await flushStatsAggregate(env, clientIp, aggregate);
+		aggregate = null;
+	}
+
+	if(!aggregate || Number(aggregate.bucket_start_ts || 0) !== currentBucket) {
+		aggregate = {
+			client_ip: clientIp,
+			bucket_start_ts: currentBucket,
+			files: {},
+			ips: {}
+		};
+	}
+
+	for(const ev of events) {
+		const fileId = String(ev.fileid || "");
+		const ip = String(ev.ip || "");
+		const bytes = Number(ev.bytes || 0);
+		const evTs = Number(ev.ts || now);
+
+		addAggRow(aggregate.files, fileId, bytes, evTs);
+		addAggRow(aggregate.ips, ip, bytes, evTs);
+	}
+
+	stats.set(clientIp, aggregate);
+	return flushed;
+}
+
+function buildClientRecord(body, clientIp, now) {
+	let timeout = Number(body.timeout || 0);
+	if(!timeout || timeout < 60) {
+		timeout = 600;
+	}
+	timeout = Math.min(timeout, 43200);
+
+	return {
+		client_ip: clientIp,
+		name: String(body.name || ""),
+		cache_url: String(body.cache_url || ""),
+		last_seen_ts: now,
+		timeout_s: timeout,
+		uptime_s: Number(body.uptime_s || 0),
+		files_sent: Number(body.files_sent || 0),
+		bytes_sent: Number(body.bytes_sent || 0),
+		cache_count: Number(body.cache_count || 0),
+		cache_size: Number(body.cache_size || 0),
+		open_connections: Number(body.open_connections || 0)
+	};
+}
+
+async function writeClientRecord(env, row) {
+	await env.HATH_DB.prepare(
+		"INSERT INTO clients (client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
+		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
+		"ON CONFLICT(client_ip) DO UPDATE SET name=excluded.name, cache_url=CASE WHEN excluded.cache_url != '' THEN excluded.cache_url ELSE clients.cache_url END, last_seen_ts=excluded.last_seen_ts, timeout_s=excluded.timeout_s, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections"
+	).bind(
+		row.client_ip,
+		row.name,
+		row.cache_url,
+		row.last_seen_ts,
+		row.timeout_s,
+		row.uptime_s,
+		row.files_sent,
+		row.bytes_sent,
+		row.cache_count,
+		row.cache_size,
+		row.open_connections
+	).run();
+}
+
+async function queueClientRecord(env, clients, row) {
+	const cached = clients.get(row.client_ip);
+	const currentBucket = getHourBucket(row.last_seen_ts);
+
+	if(!cached || Number(cached.bucket_start_ts || 0) < currentBucket) {
+		if(cached && cached.row) {
+			await writeClientRecord(env, cached.row);
+		}
+		else {
+			await writeClientRecord(env, row);
+		}
+
+		clients.set(row.client_ip, {
+			bucket_start_ts: currentBucket,
+			row: row
+		});
+		return 1;
+	}
+
+	cached.row = row;
+	clients.set(row.client_ip, cached);
+	return 0;
+}
+
 async function handleIngest(request, env) {
 	if(!env.HATH_DB) {
 		return jsonResponse({ error: "missing_db" }, 500);
 	}
+	return forwardToStatsDo(request, env, "/ingest");
+}
 
-	let body;
-	try {
-		body = await request.json();
+async function handleFlush(request, env) {
+	if(!env.HATH_DB) {
+		return jsonResponse({ error: "missing_db" }, 500);
 	}
-	catch(e) {
-		return jsonResponse({ error: "invalid_json" }, 400);
-	}
-
-	const clientId = Number(body.client_id || 0);
-	if(!clientId) {
-		return jsonResponse({ error: "missing_client_id" }, 400);
-	}
-
-	const clientIp = getClientIp(request);
-
-	const now = Number(body.ts || Math.floor(Date.now() / 1000));
-	const events = Array.isArray(body.events) ? body.events : [];
-
-	if(body.uptime_s !== undefined) {
-		const name = String(body.name || "");
-		const cacheUrl = String(body.cache_url || "");
-		let timeout = Number(body.timeout || 0);
-		if(!timeout || timeout < 60) {
-			timeout = 600;
-		}
-		timeout = Math.min(timeout, 43200);
-
-		await env.HATH_DB.prepare(
-			"INSERT INTO clients (client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
-			"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
-			"ON CONFLICT(client_ip) DO UPDATE SET name=excluded.name, cache_url=CASE WHEN excluded.cache_url != '' THEN excluded.cache_url ELSE clients.cache_url END, last_seen_ts=excluded.last_seen_ts, timeout_s=excluded.timeout_s, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections"
-		).bind(
-			clientIp,
-			name,
-			cacheUrl,
-			now,
-			timeout,
-			Number(body.uptime_s || 0),
-			Number(body.files_sent || 0),
-			Number(body.bytes_sent || 0),
-			Number(body.cache_count || 0),
-			Number(body.cache_size || 0),
-			Number(body.open_connections || 0)
-		).run();
-	}
-
-	if(events.length > 0) {
-		const stmts = [];
-		for(const ev of events) {
-			const fileId = String(ev.fileid || "");
-			const ip = String(ev.ip || "");
-			const bytes = Number(ev.bytes || 0);
-			const evTs = Number(ev.ts || now);
-
-			if(fileId.length > 0) {
-				stmts.push(env.HATH_DB.prepare(
-					"INSERT INTO file_stats (client_ip, fileid, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, 1, ?, ?) " +
-					"ON CONFLICT(client_ip, fileid) DO UPDATE SET request_count=request_count+1, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=excluded.last_seen_ts"
-				).bind(clientIp, fileId, bytes, evTs));
-			}
-
-			if(ip.length > 0) {
-				stmts.push(env.HATH_DB.prepare(
-					"INSERT INTO ip_stats (client_ip, requester_ip, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, 1, ?, ?) " +
-					"ON CONFLICT(client_ip, requester_ip) DO UPDATE SET request_count=request_count+1, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=excluded.last_seen_ts"
-				).bind(clientIp, ip, bytes, evTs));
-			}
-		}
-
-		if(stmts.length > 0) {
-			await env.HATH_DB.batch(stmts);
-		}
-	}
-
-	return jsonResponse({ ok: true, events: events.length });
+	return forwardToStatsDo(request, env, "/flush");
 }
 
 async function handleOverview(request, env) {
@@ -464,9 +583,15 @@ async function handleCacheTree(request, env) {
 	const limit = Math.min(Number(url.searchParams.get("limit") || 500), 1000);
 	const offset = Math.max(Number(url.searchParams.get("offset") || 0), 0);
 	const clientUrl = buildClientPath(cacheRef, "list", "prefix=" + prefix + ";limit=" + limit + ";offset=" + offset);
-	const upstream = await fetch(clientUrl, { headers: { "Accept": "application/json" } });
+	let upstream;
+	try {
+		upstream = await fetch(clientUrl, { headers: { "Accept": "application/json" } });
+	}
+	catch(e) {
+		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e) }, 502);
+	}
 	if(!upstream.ok) {
-		return jsonResponse({ error: "client_fetch_failed", status: upstream.status }, 502);
+		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text() }, 502);
 	}
 
 	const data = await upstream.json();
@@ -501,9 +626,15 @@ async function handleCacheFile(request, env) {
 	}
 
 	const clientUrl = buildClientPath(cacheRef, "file", fileId);
-	const upstream = await fetch(clientUrl);
+	let upstream;
+	try {
+		upstream = await fetch(clientUrl);
+	}
+	catch(e) {
+		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e) }, 502);
+	}
 	if(!upstream.ok) {
-		return jsonResponse({ error: "client_fetch_failed", status: upstream.status }, 502);
+		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text() }, 502);
 	}
 
 	const headers = new Headers();
@@ -515,6 +646,181 @@ async function handleCacheFile(request, env) {
 		headers.set("Content-Length", length);
 	}
 	return new Response(upstream.body, { status: 200, headers: headers });
+}
+
+export class HathStatsDurableObject {
+	constructor(state, env) {
+		this.state = state;
+		this.env = env;
+		this.stats = new Map();
+		this.clients = new Map();
+		this.pendingEvents = 0;
+		this.lastCheckpointMs = 0;
+		this.loaded = this.load();
+	}
+
+	async load() {
+		const stored = await this.state.storage.get(["stats", "clients", "pending_events", "last_checkpoint_ms"]);
+		this.stats = new Map(Object.entries(stored.get("stats") || {}));
+		this.clients = new Map(Object.entries(stored.get("clients") || {}));
+		this.pendingEvents = Number(stored.get("pending_events") || 0);
+		this.lastCheckpointMs = Number(stored.get("last_checkpoint_ms") || 0);
+
+		const alarm = await this.state.storage.getAlarm();
+		if(alarm === null) {
+			await this.state.storage.setAlarm(Date.now() + STATS_FLUSH_INTERVAL_S * 1000);
+		}
+	}
+
+	async checkpoint(force) {
+		const nowMs = Date.now();
+		if(!force && this.pendingEvents < DO_CHECKPOINT_EVENT_LIMIT && nowMs - this.lastCheckpointMs < DO_CHECKPOINT_INTERVAL_S * 1000) {
+			return;
+		}
+
+		await this.state.storage.put({
+			stats: Object.fromEntries(this.stats),
+			clients: Object.fromEntries(this.clients),
+			pending_events: 0,
+			last_checkpoint_ms: nowMs
+		});
+		this.pendingEvents = 0;
+		this.lastCheckpointMs = nowMs;
+	}
+
+	async flushClient(clientIp) {
+		let clientWrites = 0;
+		let statWrites = 0;
+
+		const cached = this.clients.get(clientIp);
+		if(cached && cached.row) {
+			await writeClientRecord(this.env, cached.row);
+			this.clients.delete(clientIp);
+			clientWrites = 1;
+		}
+
+		const aggregate = this.stats.get(clientIp);
+		if(aggregate) {
+			statWrites = await flushStatsAggregate(this.env, clientIp, aggregate);
+			this.stats.delete(clientIp);
+		}
+
+		if(clientWrites > 0 || statWrites > 0) {
+			await this.checkpoint(true);
+		}
+
+		return { clientWrites: clientWrites, statWrites: statWrites };
+	}
+
+	async flushExpired(now) {
+		const currentBucket = getHourBucket(now);
+		let clientWrites = 0;
+		let statWrites = 0;
+
+		for(const [clientIp, cached] of Array.from(this.clients.entries())) {
+			if(cached && Number(cached.bucket_start_ts || 0) < currentBucket && cached.row) {
+				await writeClientRecord(this.env, cached.row);
+				this.clients.delete(clientIp);
+				clientWrites += 1;
+			}
+		}
+
+		for(const [clientIp, aggregate] of Array.from(this.stats.entries())) {
+			if(aggregate && Number(aggregate.bucket_start_ts || 0) < currentBucket) {
+				statWrites += await flushStatsAggregate(this.env, clientIp, aggregate);
+				this.stats.delete(clientIp);
+			}
+		}
+
+		if(clientWrites > 0 || statWrites > 0) {
+			await this.checkpoint(true);
+		}
+
+		return { clientWrites: clientWrites, statWrites: statWrites };
+	}
+
+	async flushAll() {
+		let clientWrites = 0;
+		let statWrites = 0;
+
+		for(const clientIp of Array.from(new Set([...this.clients.keys(), ...this.stats.keys()]))) {
+			const flushed = await this.flushClient(clientIp);
+			clientWrites += flushed.clientWrites;
+			statWrites += flushed.statWrites;
+		}
+
+		await this.checkpoint(true);
+		return { clientWrites: clientWrites, statWrites: statWrites };
+	}
+
+	async handleIngest(request) {
+		let body;
+		try {
+			body = await request.json();
+		}
+		catch(e) {
+			return jsonResponse({ error: "invalid_json" }, 400);
+		}
+
+		const clientId = Number(body.client_id || 0);
+		if(!clientId) {
+			return jsonResponse({ error: "missing_client_id" }, 400);
+		}
+
+		const clientIp = request.headers.get("X-Hath-Client-IP") || "unknown";
+		const now = Number(body.ts || Math.floor(Date.now() / 1000));
+		const events = Array.isArray(body.events) ? body.events : [];
+		let flushed = 0;
+
+		if(body.uptime_s !== undefined) {
+			flushed += await queueClientRecord(this.env, this.clients, buildClientRecord(body, clientIp, now));
+		}
+
+		if(events.length > 0) {
+			flushed += await queueStatsAggregate(this.env, this.stats, clientIp, events, now);
+			this.pendingEvents += events.length;
+		}
+
+		await this.checkpoint(flushed > 0);
+		return jsonResponse({ ok: true, mode: "durable_object", events: events.length, flushed: flushed });
+	}
+
+	async handleFlush(request) {
+		const url = new URL(request.url);
+		const all = url.searchParams.get("all") === "1" || url.searchParams.get("all") === "true";
+		const clientIp = url.searchParams.get("client_ip") || request.headers.get("X-Hath-Client-IP") || "unknown";
+		const flushed = all ? await this.flushAll() : await this.flushClient(clientIp);
+		return jsonResponse({
+			ok: true,
+			mode: "durable_object",
+			client_ip: all ? null : clientIp,
+			flushed: flushed.clientWrites + flushed.statWrites,
+			client_writes: flushed.clientWrites,
+			stat_writes: flushed.statWrites
+		});
+	}
+
+	async alarm() {
+		await this.loaded;
+		await this.flushExpired(Math.floor(Date.now() / 1000));
+		await this.checkpoint(true);
+		await this.state.storage.setAlarm(Date.now() + STATS_FLUSH_INTERVAL_S * 1000);
+	}
+
+	async fetch(request) {
+		await this.loaded;
+		const url = new URL(request.url);
+
+		if(request.method === "POST" && url.pathname === "/ingest") {
+			return this.handleIngest(request);
+		}
+
+		if(request.method === "POST" && url.pathname === "/flush") {
+			return this.handleFlush(request);
+		}
+
+		return jsonResponse({ error: "not_found" }, 404);
+	}
 }
 
 function getCacheBrowserHtml(request) {
@@ -586,6 +892,14 @@ export default {
 				return authError;
 			}
 			return handleIngest(request, env);
+		}
+
+		if(request.method === "POST" && url.pathname === "/v1/flush") {
+			const authError = requireAuth(request, env, "HATH_INGEST_TOKEN", false);
+			if(authError) {
+				return authError;
+			}
+			return handleFlush(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/overview") {

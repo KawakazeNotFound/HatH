@@ -53,6 +53,7 @@ public class Settings {
 	private static Hashtable<String, Integer> staticRanges = null;
 	private static File datadir = null, logdir = null, cachedir = null, tempdir = null, downloaddir = null;
 	private static String clientKey = "", clientHost = "", dataDirPath = "data", logDirPath = "log", cacheDirPath = "cache", tempDirPath = "tmp", downloadDirPath = "download", rpcPath = "15/rpc?";
+	private static boolean cacheDirWasConfigured = false;
 
 	private static short rpcServerPort = 80;
 	private static int clientID = 0, clientPort = 0, throttle_bytes = 0, overrideConns = 0, serverTimeDelta = 0, maxAllowedFileSize = 1073741824, currentStaticRangeCount = 0, maxFilenameLength = 125, imageProxyPort = 0;
@@ -60,7 +61,7 @@ public class Settings {
 	private static long disklimit_bytes = 0, diskremaining_bytes = 0, fileSystemBlocksize = 4096;
 	private static boolean verifyCache = false, rescanCache = false, skipFreeSpaceCheck = false, warnNewClient = false, useLessMemory = false, disableBWM = false, disableDownloadBWM = false, disableFileVerification = false, disableLogs = false, flushLogs = false, disableIPOriginCheck = false, disableFloodControl = false;
 	private static boolean telemetryEnabled = false;
-	private static String telemetryEndpoint = null, telemetryToken = "", telemetryName = null;
+	private static String telemetryEndpoint = null, telemetryToken = "", telemetryName = null, cacheUrlOverride = null;
 
 	public static void setActiveClient(HentaiAtHomeClient client) {
 		activeClient = client;
@@ -328,6 +329,7 @@ public class Settings {
 			}
 			else if(setting.equals("cache_dir")) {
 				cacheDirPath = value;
+				cacheDirWasConfigured = true;
 			}
 			else if(setting.equals("temp_dir")) {
 				tempDirPath = value;
@@ -361,6 +363,9 @@ public class Settings {
 			}
 			else if(setting.equals("telemetry_token")) {
 				telemetryToken = value;
+			}
+			else if(setting.equals("cache_url")) {
+				cacheUrlOverride = value;
 			}
 			else if(setting.equals("name")) {
 				telemetryName = value;
@@ -402,14 +407,35 @@ public class Settings {
 		Out.debug("Using --log-dir=" + logDirPath);
 		logdir = Tools.checkAndCreateDir(new File(logDirPath));
 
-		Out.debug("Using --cache-dir=" + cacheDirPath);
-		cachedir = Tools.checkAndCreateDir(new File(cacheDirPath));
+		File defaultCacheDir = getDefaultCacheDir();
+		Out.debug("Using --cache-dir=" + defaultCacheDir);
+		cachedir = Tools.checkAndCreateDir(defaultCacheDir);
 
 		Out.debug("Using --temp-dir=" + tempDirPath);
 		tempdir = Tools.checkAndCreateDir(new File(tempDirPath));
 
 		Out.debug("Using --download-dir=" + downloadDirPath);
 		downloaddir = Tools.checkAndCreateDir(new File(downloadDirPath));
+	}
+
+	private static File getDefaultCacheDir() {
+		File cacheDir = new File(cacheDirPath);
+		if(cacheDirWasConfigured || cacheDir.isAbsolute() || !cacheDirPath.equals("cache")) {
+			return cacheDir;
+		}
+
+		try {
+			File location = new File(Settings.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+			File baseDir = location.isFile() ? location.getParentFile() : location;
+			if(baseDir != null) {
+				return new File(baseDir, cacheDirPath);
+			}
+		}
+		catch(Exception e) {
+			Out.debug("Failed to resolve program directory for default cache path: " + e.getMessage());
+		}
+
+		return cacheDir;
 	}
 
 	// accessor methods
@@ -571,6 +597,10 @@ public class Settings {
 
 	public static String getTelemetryName() {
 		return telemetryName;
+	}
+
+	public static String getCacheUrlOverride() {
+		return cacheUrlOverride;
 	}
 	
 	public static boolean isImageProxyEnabled() {

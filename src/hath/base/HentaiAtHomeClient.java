@@ -112,11 +112,11 @@ public class HentaiAtHomeClient implements Runnable {
 			Settings.promptForIDAndKey(iqh);
 		}
 
-		ActivityReporter.startIfEnabled();
-
 		// handles notifications other communication with the hentai@home server
 		serverHandler = new ServerHandler(this);
 		serverHandler.loadClientSettingsFromServer();
+
+		ActivityReporter.startIfEnabled();
 
 		Stats.setProgramStatus("Initializing cache handler...");
 

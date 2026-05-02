@@ -23,6 +23,7 @@ along with Hentai@Home.  If not, see <https://www.gnu.org/licenses/>.
 
 package hath.base;
 
+import java.io.File;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -83,6 +84,7 @@ public class ActivityReporter implements Runnable {
 					Settings.getTelemetryHeartbeatInterval()
 			);
 			Out.info("ActivityReporter: Enabled endpoint=" + endpoint.trim() + " heartbeat=" + Settings.getTelemetryHeartbeatInterval() + "s flush=" + Settings.getTelemetryFlushInterval() + "s batch=" + Settings.getTelemetryBatchSize() + " queue=" + Settings.getTelemetryMaxQueue() + " name=" + Settings.getTelemetryName() + " timeout=" + Settings.getTelemetryTimeout() + "s");
+			instance.writeCacheProxyScript();
 			instance.start();
 		}
 	}
@@ -266,19 +268,79 @@ public class ActivityReporter implements Runnable {
 	}
 
 	private String getCacheBrowserUrl() {
+		String override = Settings.getCacheUrlOverride();
+		if(override != null && override.trim().length() > 0) {
+			return appendToken(override.trim());
+		}
+
 		String host = Settings.getClientHost();
 		int port = Settings.getClientPort();
 		if(host == null || host.length() < 1 || port < 1) {
 			return "";
 		}
 
+		return appendToken("https://" + host.replace("::ffff:", "") + ":" + port + "/local/cache");
+	}
+
+	private String appendToken(String url) {
 		String token = Settings.getTelemetryToken();
-		String path = "/local/cache";
-		if(token != null && token.length() > 0) {
-			path += "/token=" + token;
+		if(token == null || token.length() < 1 || url.indexOf("token=") >= 0) {
+			return url;
 		}
 
-		return "https://" + host.replace("::ffff:", "") + ":" + port + path;
+		return url + (url.endsWith("/") ? "" : "/") + "token=" + token;
+	}
+
+	private void writeCacheProxyScript() {
+		try {
+			File script = new File(Settings.getDataDir(), "hath-cache-proxy.sh");
+			String token = Settings.getTelemetryToken() == null ? "" : Settings.getTelemetryToken();
+			String content =
+"#!/bin/sh\n" +
+"set -eu\n" +
+"\n" +
+"DOMAIN=\"${HATH_CACHE_DOMAIN:-}\"\n" +
+"HATH_PORT=\"${HATH_CACHE_PORT:-" + Settings.getClientPort() + "}\"\n" +
+"SCRIPT_DIR=\"$(CDPATH= cd -- \"$(dirname -- \"$0\")\" && pwd)\"\n" +
+"CADDYFILE=\"$SCRIPT_DIR/Caddyfile.hath-cache\"\n" +
+"\n" +
+"if [ -z \"$DOMAIN\" ]; then\n" +
+"  echo \"Set HATH_CACHE_DOMAIN first, for example:\"\n" +
+"  echo \"  HATH_CACHE_DOMAIN=jp1-cache.example.com sh $0\"\n" +
+"  echo \"Then start H@H with: --cache-url=https://jp1-cache.example.com/local/cache\"\n" +
+"  exit 1\n" +
+"fi\n" +
+"\n" +
+"if ! command -v caddy >/dev/null 2>&1; then\n" +
+"  echo \"caddy is required. Install it first: https://caddyserver.com/docs/install\"\n" +
+"  exit 1\n" +
+"fi\n" +
+"\n" +
+"cat > \"$CADDYFILE\" <<EOF\n" +
+"$DOMAIN {\n" +
+"  reverse_proxy https://127.0.0.1:$HATH_PORT {\n" +
+"    transport http {\n" +
+"      tls_insecure_skip_verify\n" +
+"    }\n" +
+"  }\n" +
+"}\n" +
+"EOF\n" +
+"\n" +
+"echo \"Starting cache proxy for https://$DOMAIN -> https://127.0.0.1:$HATH_PORT\"\n" +
+"echo \"Recommended H@H cache URL: https://$DOMAIN/local/cache" + (token.length() > 0 ? "/token=" + shellEscapeForEcho(token) : "") + "\"\n" +
+"exec caddy run --config \"$CADDYFILE\" --adapter caddyfile\n";
+
+			Tools.putStringFileContents(script, content, "UTF-8");
+			script.setExecutable(true, false);
+			Out.info("ActivityReporter: Wrote cache proxy helper script to " + script);
+		}
+		catch(Exception e) {
+			Out.warning("ActivityReporter: Failed to write cache proxy helper script: " + e.getMessage());
+		}
+	}
+
+	private String shellEscapeForEcho(String s) {
+		return s.replace("\\", "\\\\").replace("\"", "\\\"");
 	}
 
 	private boolean postJson(String payload) {

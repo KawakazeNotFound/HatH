@@ -109,13 +109,21 @@ public class CacheHandler {
 		}
 
 		if(!Settings.isSkipFreeSpaceCheck()) { 
-			if(cachedir.getFreeSpace() < Settings.getDiskLimitBytes() - getCacheSizeWithOverhead()) {
+			long cacheSizeWithOverhead = getCacheSizeWithOverhead();
+			long requiredFreeSpace = Settings.getDiskLimitBytes() - cacheSizeWithOverhead;
+			long diskFreeSpace = cachedir.getFreeSpace();
+			long diskUsableSpace = cachedir.getUsableSpace();
+			long diskTotalSpace = cachedir.getTotalSpace();
+
+			Out.info("CacheHandler: Disk space check path=" + cachedir.getAbsolutePath() + " free=" + diskFreeSpace + " usable=" + diskUsableSpace + " total=" + diskTotalSpace + " cacheLimit=" + Settings.getDiskLimitBytes() + " cacheSize=" + cacheSizeWithOverhead + " requiredFree=" + requiredFreeSpace);
+
+			if(requiredFreeSpace > 0 && diskUsableSpace < requiredFreeSpace) {
 				// note: if the client ends up being starved on disk space with static ranges assigned, it will cause a major loss of trust.
 				client.setFastShutdown();
-				client.dieWithError("The storage device does not have enough space available to hold the set cache size.\nFree up space for H@H, or reduce the cache size from the H@H settings page:\nhttps://e-hentai.org/hentaiathome.php?cid=" + Settings.getClientID());
+				client.dieWithError("The storage device does not have enough space available to hold the set cache size.\nCache path: " + cachedir.getAbsolutePath() + "\nUsable space: " + diskUsableSpace + " bytes\nRequired free space: " + requiredFreeSpace + " bytes\nCache limit: " + Settings.getDiskLimitBytes() + " bytes\nCurrent cache size: " + cacheSizeWithOverhead + " bytes\nFree up space for H@H, or reduce the cache size from the H@H settings page:\nhttps://e-hentai.org/hentaiathome.php?cid=" + Settings.getClientID());
 			}
 			
-			if(cachedir.getFreeSpace() < cachedir.getTotalSpace() * 0.1) {
+			if(diskUsableSpace < diskTotalSpace * 0.1) {
 				Out.info("WARNING: The storage device used for the cache has less than 10% free space. This is fine for SSDs, but if this is a HDD, 10-15% free space is necessary to avoid file fragmentation issues.");
 			}
 		}

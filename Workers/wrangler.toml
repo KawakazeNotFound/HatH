@@ -1,0 +1,16 @@
+name = "hath"
+main = "worker.js"
+compatibility_date = "2026-05-02"
+
+[[d1_databases]]
+binding = "HATH_DB"
+database_name = "hath_stats"
+database_id = "a1bf9a7f-51aa-4601-be72-bf6b00d75d6b"
+
+[[durable_objects.bindings]]
+name = "HATH_STATS"
+class_name = "HathStatsDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = [ "HathStatsDurableObject" ]
