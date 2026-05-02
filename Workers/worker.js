@@ -588,16 +588,17 @@ async function handleCacheTree(request, env) {
 		upstream = await fetch(clientUrl, { headers: { "Accept": "application/json" } });
 	}
 	catch(e) {
-		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e) }, 502);
+		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e), direct_url: clientUrl }, 502);
 	}
 	if(!upstream.ok) {
-		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text() }, 502);
+		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text(), direct_url: clientUrl }, 502);
 	}
 
 	const data = await upstream.json();
 	for(const item of (data.items || [])) {
 		if(item.type === "file") {
 			addFileMetadata(item);
+			item.direct_url = buildClientPath(cacheRef, "file", item.fileid);
 		}
 	}
 	data.client = { name: client.name, client_ip: client.client_ip };
@@ -631,10 +632,10 @@ async function handleCacheFile(request, env) {
 		upstream = await fetch(clientUrl);
 	}
 	catch(e) {
-		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e) }, 502);
+		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e), direct_url: clientUrl }, 502);
 	}
 	if(!upstream.ok) {
-		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text() }, 502);
+		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text(), direct_url: clientUrl }, 502);
 	}
 
 	const headers = new Headers();
@@ -841,7 +842,7 @@ body.light{color-scheme:light;--bg:#f6f4ef;--fg:#252525;--muted:#66736e;--title:
 <label>prefix: <input id="prefix" type="text" placeholder="e03c"></label><button onclick="goPrefix()">open</button><span class="path">/cache/<code id="path"></code></span>
 </section><section id="list"></section><section id="preview" class="preview"></section><div class="footer">H@H cache browser via Worker</div></main>
 <script>
-const auth='${tokenParam}';const initialName=${jsString(initialName)};let currentPrefix='',currentItems=[],nextOffset=null,offset=0;const limit=500;
+const auth='${tokenParam}';const initialName=${jsString(initialName)};let currentPrefix='',currentItems=[],currentDirectUrls={},nextOffset=null,offset=0;const limit=500;
 function qs(){const c=document.getElementById('client').value;return 'name='+encodeURIComponent(c)+auth;}
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function size(n){n=Number(n||0);const u=['bytes','KB','MB','GB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++;}return (i===0?Math.round(n):n.toFixed(2))+' '+u[i];}
@@ -851,9 +852,9 @@ function setTheme(v){document.body.className=v==='light'?'light':'';}
 function parentPrefix(){if(currentPrefix.length>=4)return currentPrefix.substring(0,2);if(currentPrefix.length>=2)return '';return null;}
 function goPrefix(){openPrefix(document.getElementById('prefix').value.trim().toLowerCase());}
 async function loadClients(){const res=await fetch('/v1/clients?'+auth.substring(1));const data=await res.json();const sel=document.getElementById('client');sel.innerHTML='';for(const c of data.clients||[]){const o=document.createElement('option');o.value=c.name||c.client_ip;o.textContent=(c.name||c.client_ip)+(c.cache_url?'':' (no cache url)');sel.appendChild(o);}if(initialName){sel.value=initialName;}sel.onchange=()=>openPrefix('');if(sel.value){await openPrefix('');}else{document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>No clients found.</span><span></span><span></span><span></span></div>';}}
-async function openPrefix(prefix,append){if(!append){offset=0;currentItems=[];}currentPrefix=prefix||'';document.getElementById('prefix').value=currentPrefix;document.getElementById('path').textContent=currentPrefix?currentPrefix.match(/.{1,2}/g).join('/')+'/':'';const res=await fetch('/v1/cache/tree?'+qs()+'&prefix='+currentPrefix+'&limit='+limit+'&offset='+offset);const data=await res.json();if(data.error){document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>'+esc(data.error)+'</span><span></span><span></span><span></span></div>';return;}currentItems=currentItems.concat(data.items||[]);nextOffset=data.next_offset;renderList();}
+async function openPrefix(prefix,append){if(!append){offset=0;currentItems=[];currentDirectUrls={};}currentPrefix=prefix||'';document.getElementById('prefix').value=currentPrefix;document.getElementById('path').textContent=currentPrefix?currentPrefix.match(/.{1,2}/g).join('/')+'/':'';const res=await fetch('/v1/cache/tree?'+qs()+'&prefix='+currentPrefix+'&limit='+limit+'&offset='+offset);const data=await res.json();if(data.error){const direct=data.direct_url?' <a href="'+esc(data.direct_url)+'" target="_blank" rel="noopener">open direct</a>':'';document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>'+esc(data.error)+direct+'</span><span></span><span></span><span></span></div>';return;}for(const item of data.items||[]){if(item.type==='file'&&item.direct_url){currentDirectUrls[item.fileid]=item.direct_url;}}currentItems=currentItems.concat(data.items||[]);nextOffset=data.next_offset;renderList();}
 function renderList(){const list=document.getElementById('list');let items=currentItems.slice();const mode=sortMode();items.sort((a,b)=>a.type!==b.type?a.type==='dir'?-1:1:mode==='size'?(b.size||0)-(a.size||0):mode==='date'?(b.last_modified||0)-(a.last_modified||0):String(a.name||a.display_name||a.fileid).localeCompare(String(b.name||b.display_name||b.fileid)));let html='';const parent=parentPrefix();if(parent!==null){html+='<div class=entry><span class=up>&#8634;</span><a class=name href=# onclick="openPrefix(\\''+parent+'\\');return false;">..</a><span></span><span></span><span></span></div>';}for(const item of items){if(item.type==='dir'){html+='<div class=entry><span class="icon folder"></span><a class=name href=# onclick="openPrefix(\\''+esc(item.prefix)+'\\');return false;">'+esc(item.name)+'</a><span class=pill>folder</span><span></span><span></span></div>';}else{html+='<div class=entry><span class="icon file"></span><a class=name href=# onclick="preview(\\''+esc(item.fileid)+'\\',\\''+esc(item.mime)+'\\');return false;">'+esc(item.display_name||item.fileid)+'<span class=sub>'+esc(item.fileid)+'</span></a><span class=pill>'+esc(item.extension||item.mime)+'</span><span class="pill bytes">'+size(item.size)+'</span><span class="sub age">'+age(item.last_modified)+'</span></div>';}}if(nextOffset!==null){html+='<div style="margin-top:16px"><button onclick="offset=nextOffset;openPrefix(currentPrefix,true)">load more</button></div>';}list.innerHTML=html;}
-function preview(fileid,mime){const url='/v1/cache/file?'+qs()+'&fileid='+encodeURIComponent(fileid);const box=document.getElementById('preview');const cap='<div class=caption>'+esc(fileid)+'</div>';box.innerHTML=mime.startsWith('video/')?cap+'<video controls src="'+url+'"></video>':cap+'<img src="'+url+'" />';box.scrollIntoView({block:'nearest'});}
+function preview(fileid,mime){const url='/v1/cache/file?'+qs()+'&fileid='+encodeURIComponent(fileid);const direct=currentDirectUrls[fileid]||'';const directLink=direct?' <a href="'+esc(direct)+'" target="_blank" rel="noopener">open direct</a>':'';const box=document.getElementById('preview');const cap='<div class=caption>'+esc(fileid)+directLink+'</div>';box.innerHTML=mime.startsWith('video/')?cap+'<video controls src="'+url+'"></video>':cap+'<img src="'+url+'" />';const media=box.querySelector('img,video');if(media){media.onerror=()=>{box.innerHTML=direct?'<div class=caption>Proxy failed. '+directLink+'</div>':'<div class=caption>Proxy failed.</div>';};}box.scrollIntoView({block:'nearest'});}
 loadClients();
 </script></body></html>`;
 }

@@ -60,8 +60,10 @@ public class Settings {
 	private static int telemetryBatchSize = 200, telemetryFlushInterval = 30, telemetryMaxQueue = 2000, telemetryHeartbeatInterval = 60, telemetryTimeout = 600;
 	private static long disklimit_bytes = 0, diskremaining_bytes = 0, fileSystemBlocksize = 4096;
 	private static boolean verifyCache = false, rescanCache = false, skipFreeSpaceCheck = false, warnNewClient = false, useLessMemory = false, disableBWM = false, disableDownloadBWM = false, disableFileVerification = false, disableLogs = false, flushLogs = false, disableIPOriginCheck = false, disableFloodControl = false;
-	private static boolean telemetryEnabled = false;
+	private static boolean telemetryEnabled = false, cacheBrowserEnabled = false;
 	private static String telemetryEndpoint = null, telemetryToken = "", telemetryName = null, cacheUrlOverride = null;
+	private static String cacheBrowserHost = "127.0.0.1";
+	private static int cacheBrowserPort = 8080;
 
 	public static void setActiveClient(HentaiAtHomeClient client) {
 		activeClient = client;
@@ -367,6 +369,15 @@ public class Settings {
 			else if(setting.equals("cache_url")) {
 				cacheUrlOverride = value;
 			}
+			else if(setting.equals("cache_browser_enabled")) {
+				cacheBrowserEnabled = value.equals("true");
+			}
+			else if(setting.equals("cache_browser_host")) {
+				cacheBrowserHost = value;
+			}
+			else if(setting.equals("cache_browser_port")) {
+				cacheBrowserPort = Integer.parseInt(value);
+			}
 			else if(setting.equals("name")) {
 				telemetryName = value;
 			}
@@ -601,6 +612,18 @@ public class Settings {
 
 	public static String getCacheUrlOverride() {
 		return cacheUrlOverride;
+	}
+
+	public static boolean isCacheBrowserEnabled() {
+		return cacheBrowserEnabled;
+	}
+
+	public static String getCacheBrowserHost() {
+		return cacheBrowserHost;
+	}
+
+	public static int getCacheBrowserPort() {
+		return cacheBrowserPort;
 	}
 	
 	public static boolean isImageProxyEnabled() {

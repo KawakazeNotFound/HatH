@@ -55,6 +55,7 @@ public class HentaiAtHomeClient implements Runnable {
 	private Out out;
 	private boolean shutdown, reportShutdown, fastShutdown, threadInterruptable, doCertRefresh;
 	private HTTPServer httpServer;
+	private CacheBrowserServer cacheBrowserServer;
 	private ClientAPI clientAPI;
 	private CacheHandler cacheHandler;
 	private ServerHandler serverHandler;
@@ -132,6 +133,15 @@ public class HentaiAtHomeClient implements Runnable {
 
 		if(isShuttingDown()) {
 			return;
+		}
+
+		if(Settings.isCacheBrowserEnabled()) {
+			cacheBrowserServer = new CacheBrowserServer();
+			if(!cacheBrowserServer.start()) {
+				setFastShutdown();
+				dieWithError("Failed to initialize CacheBrowserServer");
+				return;
+			}
 		}
 
 		// if something causes the client to terminate after this point, we want the cache to be shut down cleanly to store the state
@@ -441,6 +451,10 @@ public class HentaiAtHomeClient implements Runnable {
 			else {
 				String[] sd = {"I don't hate you", "Whyyyyyyyy...", "No hard feelings", "Your business is appreciated", "Good-night"};
 				Out.info(sd[(int) Math.floor(Math.random() * sd.length)]);
+			}
+
+			if(cacheBrowserServer != null) {
+				cacheBrowserServer.stop();
 			}
 
 			if(cacheHandler != null) {

@@ -274,12 +274,13 @@ public class ActivityReporter implements Runnable {
 		}
 
 		String host = Settings.getClientHost();
-		int port = Settings.getClientPort();
+		int port = Settings.isCacheBrowserEnabled() ? Settings.getCacheBrowserPort() : Settings.getClientPort();
 		if(host == null || host.length() < 1 || port < 1) {
 			return "";
 		}
 
-		return appendToken("https://" + host.replace("::ffff:", "") + ":" + port + "/local/cache");
+		String protocol = Settings.isCacheBrowserEnabled() ? "http://" : "https://";
+		return appendToken(protocol + host.replace("::ffff:", "") + ":" + port + "/local/cache");
 	}
 
 	private String appendToken(String url) {
