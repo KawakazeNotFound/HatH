@@ -571,27 +571,29 @@ async function handleOverview(request, env) {
 		const avgSpeed = uptime > 0 ? bytesSent / uptime : 0;
 		const timeout = Math.min(Number(row.timeout_s || 600), 43200);
 		const clientIp = row.client_ip;
-		let topFile = null;
-		let topIp = null;
+		let topFiles = [];
+		let topIps = [];
 
 		if(clientIp) {
 			const topFileRes = await env.HATH_DB.prepare(
-				"SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 1"
+				"SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 10"
 			).bind(clientIp).all();
-			if(topFileRes.results && topFileRes.results.length > 0) {
-				topFile = topFileRes.results[0];
+			topFiles = (topFileRes.results || []).map((topFile) => {
 				addFileMetadata(topFile);
 				topFile.last_seen = formatTimestamp(topFile.last_seen_ts, tzOffsetSeconds);
-			}
+				return topFile;
+			});
 
 			const topIpRes = await env.HATH_DB.prepare(
-				"SELECT requester_ip AS ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 1"
+				"SELECT requester_ip AS ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 10"
 			).bind(clientIp).all();
-			if(topIpRes.results && topIpRes.results.length > 0) {
-				topIp = topIpRes.results[0];
+			topIps = (topIpRes.results || []).map((topIp) => {
 				topIp.last_seen = formatTimestamp(topIp.last_seen_ts, tzOffsetSeconds);
-			}
+				return topIp;
+			});
 		}
+		const topFile = topFiles[0] || null;
+		const topIp = topIps[0] || null;
 
 		const name = row.name && row.name.length > 0 ? row.name : "client";
 		let key = name;
@@ -617,7 +619,9 @@ async function handleOverview(request, env) {
 			open_connections: row.open_connections || 0,
 			total_requests: row.total_requests || 0,
 			top_file: topFile,
-			top_ip: topIp
+			top_files: topFiles,
+			top_ip: topIp,
+			top_ips: topIps
 		};
 
 		clientsByName[key] = clientEntry;

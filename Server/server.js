@@ -113,6 +113,25 @@ function asNumber(value) {
 	return Number(value);
 }
 
+function asArray(value) {
+	if(Array.isArray(value)) {
+		return value;
+	}
+	if(!value) {
+		return [];
+	}
+	if(typeof value === "string") {
+		try {
+			const parsed = JSON.parse(value);
+			return Array.isArray(parsed) ? parsed : [];
+		}
+		catch(e) {
+			return [];
+		}
+	}
+	return [];
+}
+
 function normalizeClient(row) {
 	return {
 		client_ip: row.client_ip,
@@ -315,12 +334,17 @@ async function overview(url) {
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	const result = await pool.query(
 		"SELECT c.*, COALESCE(ct.total_requests, 0) AS total_requests, " +
-		"tf.fileid AS top_fileid, tf.request_count AS top_file_requests, tf.bytes_sent AS top_file_bytes, tf.last_seen_ts AS top_file_last_seen, " +
-		"ti.requester_ip AS top_ip, ti.request_count AS top_ip_requests, ti.bytes_sent AS top_ip_bytes, ti.last_seen_ts AS top_ip_last_seen " +
+		"tf.top_files, ti.top_ips " +
 		"FROM clients c " +
 		"LEFT JOIN client_totals ct ON ct.client_ip = c.client_ip " +
-		"LEFT JOIN LATERAL (SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = c.client_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 1) tf ON true " +
-		"LEFT JOIN LATERAL (SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = c.client_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 1) ti ON true " +
+		"LEFT JOIN LATERAL (" +
+		"SELECT json_agg(json_build_object('fileid', fileid, 'request_count', request_count, 'bytes_sent', bytes_sent, 'last_seen_ts', last_seen_ts) ORDER BY request_count DESC, bytes_sent DESC) AS top_files " +
+		"FROM (SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = c.client_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 10) ranked_files" +
+		") tf ON true " +
+		"LEFT JOIN LATERAL (" +
+		"SELECT json_agg(json_build_object('ip', requester_ip, 'request_count', request_count, 'bytes_sent', bytes_sent, 'last_seen_ts', last_seen_ts) ORDER BY request_count DESC, bytes_sent DESC) AS top_ips " +
+		"FROM (SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = c.client_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 10) ranked_ips" +
+		") ti ON true " +
 		"ORDER BY c.last_seen_ts DESC"
 	);
 
@@ -332,28 +356,25 @@ async function overview(url) {
 		const uptime = asNumber(row.uptime_s);
 		const avgSpeed = uptime > 0 ? bytesSent / uptime : 0;
 		const timeout = Math.min(asNumber(row.timeout_s || 600), 43200);
-		let topFile = null;
-		let topIp = null;
-
-		if(row.top_fileid) {
-			topFile = addFileMetadata({
-				fileid: row.top_fileid,
-				request_count: asNumber(row.top_file_requests),
-				bytes_sent: asNumber(row.top_file_bytes),
-				last_seen_ts: asNumber(row.top_file_last_seen)
+		const topFiles = asArray(row.top_files).map((file) => {
+			const topFile = addFileMetadata({
+				fileid: file.fileid,
+				request_count: asNumber(file.request_count),
+				bytes_sent: asNumber(file.bytes_sent),
+				last_seen_ts: asNumber(file.last_seen_ts)
 			});
 			topFile.last_seen = formatTimestamp(topFile.last_seen_ts, tzOffsetSeconds);
-		}
-
-		if(row.top_ip) {
-			topIp = {
-				ip: row.top_ip,
-				request_count: asNumber(row.top_ip_requests),
-				bytes_sent: asNumber(row.top_ip_bytes),
-				last_seen_ts: asNumber(row.top_ip_last_seen),
-				last_seen: formatTimestamp(row.top_ip_last_seen, tzOffsetSeconds)
-			};
-		}
+			return topFile;
+		});
+		const topIps = asArray(row.top_ips).map((ip) => ({
+			ip: ip.ip,
+			request_count: asNumber(ip.request_count),
+			bytes_sent: asNumber(ip.bytes_sent),
+			last_seen_ts: asNumber(ip.last_seen_ts),
+			last_seen: formatTimestamp(ip.last_seen_ts, tzOffsetSeconds)
+		}));
+		const topFile = topFiles[0] || null;
+		const topIp = topIps[0] || null;
 
 		const name = row.name && row.name.length > 0 ? row.name : "client";
 		let key = name;
@@ -379,7 +400,9 @@ async function overview(url) {
 			open_connections: asNumber(row.open_connections),
 			total_requests: asNumber(row.total_requests),
 			top_file: topFile,
-			top_ip: topIp
+			top_files: topFiles,
+			top_ip: topIp,
+			top_ips: topIps
 		};
 
 		clientsByName[key] = clientEntry;
