@@ -170,47 +170,140 @@
             overflow: hidden;
             text-overflow: ellipsis;
             color: #aaa;
-            cursor: help;
-            border-bottom: 1px dashed transparent;
+            cursor: pointer;
+            border-bottom: 1px dashed #333;
             transition: all 0.2s ease;
         }
 
         .top-value:hover {
-            white-space: normal;
-            word-break: break-all;
             color: #fff;
             text-shadow: var(--glow);
-            background: #000;
-            position: absolute;
-            top: 15px;
-            left: -5px;
-            right: -5px;
-            padding: 8px;
-            border: 1px solid #444;
-            z-index: 100;
-            box-shadow: var(--glow);
+            border-bottom-color: var(--accent);
         }
 
         #file-preview-window {
             position: fixed;
             display: none;
-            width: 300px;
-            max-height: 400px;
+            width: 320px;
             background: #000;
             border: 1px solid var(--accent);
             box-shadow: var(--glow);
             z-index: 1000;
             pointer-events: none;
             overflow: hidden;
-            padding: 5px;
+            padding: 0;
+        }
+
+        #file-preview-window .preview-header {
+            background: #111;
+            padding: 5px 10px;
+            font-size: 0.6rem;
+            color: #888;
+            border-bottom: 1px solid #222;
+            word-break: break-all;
         }
 
         #file-preview-window img {
             width: 100%;
             height: auto;
             display: block;
-            filter: grayscale(0.5) contrast(1.2);
+            filter: grayscale(0.3) contrast(1.1);
         }
+
+        /* Modal / Window Style */
+        #hologram-modal {
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(0,0,0,0.85);
+            display: none;
+            z-index: 2000;
+            justify-content: center;
+            align-items: center;
+            backdrop-filter: blur(5px);
+        }
+
+        .hologram-window {
+            width: 90%;
+            max-width: 1000px;
+            background: #000;
+            border: 1px solid var(--accent);
+            box-shadow: 0 0 30px rgba(255,255,255,0.2);
+            display: flex;
+            flex-direction: column;
+            animation: windowOpen 0.3s ease-out;
+        }
+
+        @keyframes windowOpen {
+            from { transform: scale(0.95); opacity: 0; }
+            to { transform: scale(1); opacity: 1; }
+        }
+
+        .window-title-bar {
+            background: #111;
+            padding: 10px 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid #222;
+        }
+
+        .window-title {
+            font-size: 0.8rem;
+            letter-spacing: 2px;
+            color: #aaa;
+        }
+
+        .window-close {
+            cursor: pointer;
+            color: #fff;
+            font-size: 1.2rem;
+            line-height: 1;
+        }
+
+        .window-close:hover { text-shadow: var(--glow); }
+
+        .window-body {
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .window-img-container {
+            width: 100%;
+            background: #050505;
+            display: flex;
+            justify-content: center;
+            border: 1px solid #111;
+        }
+
+        .window-img-container img {
+            max-width: 100%;
+            max-height: 60vh;
+            object-fit: contain;
+        }
+
+        .window-footer {
+            padding: 15px 20px;
+            background: #080808;
+            border-top: 1px solid #1a1a1a;
+            font-size: 0.8rem;
+            color: #888;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .footer-item {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .footer-label { font-size: 0.6rem; color: #444; text-transform: uppercase; }
+        .footer-value { color: #eee; word-break: break-all; }
 
         #file-preview-window .loading-text {
             padding: 20px;
@@ -273,8 +366,26 @@
         </main>
 
         <div id="file-preview-window">
+            <div class="preview-header" id="preview-header-text">ID::UNKNOWN</div>
             <div class="loading-text">RELOADING...</div>
             <img id="preview-img" src="" alt="preview" style="display: none;">
+        </div>
+
+        <div id="hologram-modal">
+            <div class="hologram-window">
+                <div class="window-title-bar">
+                    <div class="window-title">SYSTEM::SECURE_VIEWER</div>
+                    <div class="window-close" onclick="closeModal()">&times;</div>
+                </div>
+                <div class="window-body">
+                    <div class="window-img-container">
+                        <img id="modal-img" src="" alt="large preview">
+                    </div>
+                </div>
+                <div id="modal-footer" class="window-footer">
+                    <!-- Footer details injected here -->
+                </div>
+            </div>
         </div>
 
         <footer>
@@ -286,16 +397,20 @@
         const AUTH_TOKEN = "{{AUTH_TOKEN}}";
         const previewWindow = document.getElementById('file-preview-window');
         const previewImg = document.getElementById('preview-img');
+        const previewHeaderText = document.getElementById('preview-header-text');
         const loadingText = previewWindow.querySelector('.loading-text');
+        
+        const hologramModal = document.getElementById('hologram-modal');
+        const modalImg = document.getElementById('modal-img');
+        const modalFooter = document.getElementById('modal-footer');
 
         document.addEventListener('mousemove', (e) => {
             if (previewWindow.style.display === 'block') {
                 const x = e.clientX + 20;
                 const y = e.clientY + 20;
-                // Keep within viewport
                 const winWidth = window.innerWidth;
                 const winHeight = window.innerHeight;
-                const boxWidth = 300;
+                const boxWidth = 320;
                 const boxHeight = previewWindow.offsetHeight;
 
                 let finalX = x;
@@ -312,6 +427,7 @@
         function showPreview(fileid, clientName) {
             if (!fileid || fileid === 'NO_DATA') return;
             
+            previewHeaderText.textContent = `ID::${fileid}`;
             previewWindow.style.display = 'block';
             previewImg.style.display = 'none';
             loadingText.style.display = 'block';
@@ -335,6 +451,39 @@
             previewWindow.style.display = 'none';
             previewImg.src = '';
         }
+
+        function openModal(fileid, clientName, reqCount, lastSeen) {
+            if (!fileid || fileid === 'NO_DATA') return;
+            
+            hidePreview();
+            hologramModal.style.display = 'flex';
+            modalImg.src = `/v1/cache/file?fileid=${encodeURIComponent(fileid)}&name=${encodeURIComponent(clientName)}&token=${encodeURIComponent(AUTH_TOKEN)}`;
+            
+            modalFooter.innerHTML = `
+                <div class="footer-item">
+                    <span class="footer-label">Object Identity</span>
+                    <span class="footer-value">${fileid}</span>
+                </div>
+                <div class="footer-item">
+                    <span class="footer-label">Source Node</span>
+                    <span class="footer-value">${clientName}</span>
+                </div>
+                <div class="footer-item">
+                    <span class="footer-label">Access Statistics</span>
+                    <span class="footer-value">Requests: ${reqCount} | Last Activity: ${lastSeen}</span>
+                </div>
+            `;
+        }
+
+        function closeModal() {
+            hologramModal.style.display = 'none';
+            modalImg.src = '';
+        }
+
+        // Close modal on escape key
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') closeModal();
+        });
 
         function maskIp(ip) {
             if (!ip) return "N/A";
@@ -448,6 +597,7 @@
                                 <div class="top-value" 
                                      onmouseenter="showPreview('${topFile ? topFile.fileid : ''}', '${client.name}')" 
                                      onmouseleave="hidePreview()"
+                                     onclick="openModal('${topFile ? topFile.fileid : ''}', '${client.name}', '${topFile ? topFile.request_count : 0}', '${topFile ? topFile.last_seen : ''}')"
                                      title="${topFile ? topFile.fileid : ''}">
                                     ${topFile ? topFile.fileid : 'NO_DATA'}
                                 </div>
