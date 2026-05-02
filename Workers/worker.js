@@ -7,6 +7,8 @@ const D1_BATCH_SIZE = 50;
 const STATS_API_BATCH_SIZE = 500;
 const DO_CHECKPOINT_INTERVAL_S = 60;
 const DO_CHECKPOINT_EVENT_LIMIT = 1000;
+const CLIENT_INACTIVE_AFTER_S = 2 * 60 * 60;
+const CLIENT_DELETE_AFTER_S = 12 * 60 * 60;
 
 function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
@@ -504,6 +506,15 @@ async function queueClientRecord(env, clients, row) {
 	return 0;
 }
 
+async function deleteExpiredClients(env, now) {
+	const cutoff = now - CLIENT_DELETE_AFTER_S;
+	await env.HATH_DB.batch([
+		env.HATH_DB.prepare("DELETE FROM file_stats WHERE client_ip IN (SELECT client_ip FROM clients WHERE last_seen_ts <= ?)").bind(cutoff),
+		env.HATH_DB.prepare("DELETE FROM ip_stats WHERE client_ip IN (SELECT client_ip FROM clients WHERE last_seen_ts <= ?)").bind(cutoff),
+		env.HATH_DB.prepare("DELETE FROM clients WHERE last_seen_ts <= ?").bind(cutoff)
+	]);
+}
+
 async function handleIngest(request, env) {
 	if(!hasStatsStore(env)) {
 		return statsStoreMissingResponse();
@@ -542,6 +553,8 @@ async function handleOverview(request, env) {
 	}
 
 	const now = Math.floor(Date.now() / 1000);
+	await deleteExpiredClients(env, now);
+
 	const tzOffsetSeconds = getTzOffsetSeconds(new URL(request.url));
 	const res = await env.HATH_DB.prepare(
 		"SELECT client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections, " +
@@ -552,7 +565,7 @@ async function handleOverview(request, env) {
 	const clientsByName = {};
 	let totalRequests = 0;
 	for(const row of (res.results || [])) {
-		const active = Number(row.last_seen_ts || 0) >= (now - 10800);
+		const active = Number(row.last_seen_ts || 0) >= (now - CLIENT_INACTIVE_AFTER_S);
 		const bytesSent = Number(row.bytes_sent || 0);
 		const uptime = Number(row.uptime_s || 0);
 		const avgSpeed = uptime > 0 ? bytesSent / uptime : 0;
@@ -630,6 +643,8 @@ async function handleClients(request, env) {
 	}
 
 	const url = new URL(request.url);
+	await deleteExpiredClients(env, Math.floor(Date.now() / 1000));
+
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	const limit = Math.min(Number(url.searchParams.get("limit") || 200), 1000);
 	const res = await env.HATH_DB.prepare("SELECT * FROM clients ORDER BY last_seen_ts DESC LIMIT ?").bind(limit).all();
@@ -716,6 +731,8 @@ async function resolveClient(request, env) {
 			throw e;
 		}
 	}
+
+	await deleteExpiredClients(env, Math.floor(Date.now() / 1000));
 
 	if(clientIp) {
 		const res = await env.HATH_DB.prepare("SELECT client_ip, name, cache_url FROM clients WHERE client_ip = ? LIMIT 1").bind(clientIp).all();

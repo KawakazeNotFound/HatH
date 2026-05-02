@@ -5,6 +5,8 @@ const { Pool } = require("pg");
 const PORT = Number(process.env.PORT || 8789);
 const API_TOKEN = process.env.HATH_API_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const CLIENT_INACTIVE_AFTER_S = 2 * 60 * 60;
+const CLIENT_DELETE_AFTER_S = 12 * 60 * 60;
 
 if(!DATABASE_URL) {
 	console.error("Missing DATABASE_URL");
@@ -259,7 +261,37 @@ async function upsertAggregate(body) {
 	}
 }
 
+async function deleteExpiredClients(now) {
+	const cutoff = now - CLIENT_DELETE_AFTER_S;
+	const client = await pool.connect();
+	try {
+		await client.query("BEGIN");
+		const result = await client.query("SELECT client_ip FROM clients WHERE last_seen_ts <= $1", [cutoff]);
+		const clientIps = result.rows.map((row) => row.client_ip).filter(Boolean);
+		if(clientIps.length === 0) {
+			await client.query("COMMIT");
+			return 0;
+		}
+
+		await client.query("DELETE FROM file_stats WHERE client_ip = ANY($1::text[])", [clientIps]);
+		await client.query("DELETE FROM ip_stats WHERE client_ip = ANY($1::text[])", [clientIps]);
+		await client.query("DELETE FROM client_totals WHERE client_ip = ANY($1::text[])", [clientIps]);
+		await client.query("DELETE FROM clients WHERE client_ip = ANY($1::text[])", [clientIps]);
+		await client.query("COMMIT");
+		return clientIps.length;
+	}
+	catch(e) {
+		await client.query("ROLLBACK");
+		throw e;
+	}
+	finally {
+		client.release();
+	}
+}
+
 async function resolveClient(url) {
+	await deleteExpiredClients(Math.floor(Date.now() / 1000));
+
 	const clientIp = url.searchParams.get("client_ip");
 	const name = url.searchParams.get("name");
 	let result;
@@ -278,6 +310,8 @@ async function resolveClient(url) {
 
 async function overview(url) {
 	const now = Math.floor(Date.now() / 1000);
+	await deleteExpiredClients(now);
+
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	const result = await pool.query(
 		"SELECT c.*, COALESCE(ct.total_requests, 0) AS total_requests, " +
@@ -293,7 +327,7 @@ async function overview(url) {
 	const clientsByName = {};
 	let totalRequests = 0;
 	for(const row of result.rows) {
-		const active = asNumber(row.last_seen_ts) >= (now - 10800);
+		const active = asNumber(row.last_seen_ts) >= (now - CLIENT_INACTIVE_AFTER_S);
 		const bytesSent = asNumber(row.bytes_sent);
 		const uptime = asNumber(row.uptime_s);
 		const avgSpeed = uptime > 0 ? bytesSent / uptime : 0;
@@ -362,6 +396,8 @@ async function overview(url) {
 }
 
 async function clients(url) {
+	await deleteExpiredClients(Math.floor(Date.now() / 1000));
+
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	const limit = Math.min(Number(url.searchParams.get("limit") || 200), 1000);
 	const result = await pool.query("SELECT * FROM clients ORDER BY last_seen_ts DESC LIMIT $1", [limit]);
