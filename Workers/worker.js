@@ -1,3 +1,5 @@
+import dashboardHtmlRaw from "./dashboard.html";
+
 const JSON_HEADERS = {"Content-Type": "application/json"};
 const HTML_HEADERS = {"Content-Type": "text/html; charset=utf-8"};
 const STATS_FLUSH_INTERVAL_S = 3600;
@@ -423,8 +425,11 @@ async function handleOverview(request, env) {
 	const clientsByName = {};
 	let totalRequests = 0;
 	for(const row of (res.results || [])) {
+		const active = Number(row.last_seen_ts || 0) >= (now - 10800);
+		const bytesSent = Number(row.bytes_sent || 0);
+		const uptime = Number(row.uptime_s || 0);
+		const avgSpeed = uptime > 0 ? bytesSent / uptime : 0;
 		const timeout = Math.min(Number(row.timeout_s || 600), 43200);
-		const active = Number(row.last_seen_ts || 0) >= (now - timeout);
 		const clientIp = row.client_ip;
 		let topFile = null;
 		let topIp = null;
@@ -466,6 +471,7 @@ async function handleOverview(request, env) {
 			uptime_s: row.uptime_s || 0,
 			files_sent: row.files_sent || 0,
 			bytes_sent: row.bytes_sent || 0,
+			avg_speed: avgSpeed,
 			cache_count: row.cache_count || 0,
 			cache_size: row.cache_size || 0,
 			open_connections: row.open_connections || 0,
@@ -881,6 +887,12 @@ export class HathStatsDurableObject {
 	}
 }
 
+function getDashboardHtml(request) {
+	const tokenParam = getReadTokenParam(request);
+	const token = tokenParam.startsWith("&token=") ? tokenParam.substring(7) : "";
+	return dashboardHtmlRaw.replace("{{AUTH_TOKEN}}", token);
+}
+
 function getCacheBrowserHtml(request) {
 	const url = new URL(request.url);
 	const tokenParam = getReadTokenParam(request);
@@ -929,6 +941,14 @@ export default {
 				return authError;
 			}
 			return htmlResponse(getCacheBrowserHtml(request));
+		}
+
+		if(request.method === "GET" && url.pathname === "/dashboard") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return htmlResponse(getDashboardHtml(request));
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/cache/tree") {
