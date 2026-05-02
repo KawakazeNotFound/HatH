@@ -238,27 +238,160 @@ bytes_sent += 聚合后的字节数
 last_seen_ts = max(已有值, 聚合值)
 ```
 
-## 查询接口
+## 完整 API 清单
 
-查询接口只读 D1，不读取 Durable Object 当前内存里的未 flush 数据。
+所有公开路由都需要 token。写入/运维类接口使用 `HATH_INGEST_TOKEN`；读取和浏览器接口使用 `HATH_READ_TOKEN`。
 
-```text
-GET /v1/overview
-GET /v1/clients
-GET /v1/top/files
-GET /v1/top/ips
-GET /v1/cache/tree
-GET /v1/cache/file
-GET /cache
+`HATH_INGEST_TOKEN` 只能通过 header 传入：
+
+```http
+Authorization: Bearer <HATH_INGEST_TOKEN>
+X-Auth-Token: <HATH_INGEST_TOKEN>
 ```
 
-这些接口使用 `HATH_READ_TOKEN` 鉴权。浏览器访问时可以把 token 放到 query string：
+`HATH_READ_TOKEN` 可以通过 header 传入；为了方便浏览器访问，也可以用 `?token=<HATH_READ_TOKEN>`：
 
-```text
-/v1/overview?token=<HATH_READ_TOKEN>
+```http
+Authorization: Bearer <HATH_READ_TOKEN>
+X-Auth-Token: <HATH_READ_TOKEN>
 ```
 
-因为查询只读 D1，所以刚刚 ingest 的数据不一定会立刻出现在页面上。想立即看到最新数据，可以先执行：
+注意：当前 `worker.js` 里如果某个 secret binding 没配置，`requireAuth()` 会把对应 token 类型视为“不启用鉴权”。对外暴露 Worker 前，必须确认 `HATH_INGEST_TOKEN` 和 `HATH_READ_TOKEN` 都已经配置。
+
+查询接口只读 D1，不读取 Durable Object 当前内存里的未 flush 数据。因此刚刚 ingest 的数据不一定会立刻出现在页面上，要等下一次每小时 flush 或手动 flush。
+
+### 写入和刷新接口
+
+`POST /v1/ingest`
+
+需要 `HATH_INGEST_TOKEN`。接收客户端心跳和请求事件，然后转发给全局 Durable Object 做聚合。
+
+JSON body 字段：
+
+- `client_id`: 必填，数字客户端 ID。
+- `ts`: 可选，Unix 秒级时间戳；默认使用 Worker 当前时间。
+- `name`: 可选，客户端名称。
+- `cache_url`: 可选，客户端 cache browser URL。
+- `timeout`: 可选，活跃超时时间，单位秒；最小 60，默认 600，最大 43200。
+- `uptime_s`、`files_sent`、`bytes_sent`、`cache_count`、`cache_size`、`open_connections`: 可选客户端计数器。
+- `events`: 可选请求事件数组。每个事件可以包含 `fileid`、`ip`、`bytes`、`ts`。
+
+`POST /v1/flush`
+
+需要 `HATH_INGEST_TOKEN`。把 Durable Object 里缓冲的聚合数据写入 D1。
+
+Query 参数：
+
+- `client_ip`: 可选，指定要 flush 的客户端 IP。不传时使用 Worker 推导出的客户端 IP。
+- `all=1` 或 `all=true`: flush 所有客户端，而不是单个客户端。
+
+`GET /v1/refresh`
+
+需要 `HATH_READ_TOKEN`。浏览器/运维方便使用的全量 flush 入口，等价于内部 `POST /flush?all=1`。
+
+`POST /v1/refresh`
+
+同 `GET /v1/refresh`。需要 `HATH_READ_TOKEN`。
+
+### 读取接口
+
+`GET /v1/overview`
+
+需要 `HATH_READ_TOKEN`。返回全局概览、活跃客户端数、总请求数，以及每个客户端的 top file/top requester IP。
+
+Query 参数：
+
+- `tz`: 可选时区偏移。绝对值 `<= 24` 时按小时处理；更大的值按分钟处理，并限制在 +/- 1440 分钟内。
+
+`GET /v1/clients`
+
+需要 `HATH_READ_TOKEN`。按 `last_seen_ts` 倒序列出客户端记录。
+
+Query 参数：
+
+- `limit`: 可选返回数量；默认 200，最大 1000。
+- `tz`: 可选时区偏移。
+
+`GET /v1/top/files`
+
+需要 `HATH_READ_TOKEN`。查询某个客户端请求最多的文件。
+
+Query 参数：
+
+- `client_ip` 或 `name`: 二选一。两者都不传时，这个接口会返回 `missing_client`。
+- `limit`: 可选返回数量；默认 50，最大 500。
+- `tz`: 可选时区偏移。
+
+`GET /v1/cache/files`
+
+`GET /v1/top/files` 的别名。需要 `HATH_READ_TOKEN`，参数相同。
+
+`GET /v1/top/ips`
+
+需要 `HATH_READ_TOKEN`。查询某个客户端请求最多的 requester IP。
+
+Query 参数：
+
+- `client_ip` 或 `name`: 二选一。两者都不传时，这个接口会返回 `missing_client`。
+- `limit`: 可选返回数量；默认 50，最大 500。
+- `tz`: 可选时区偏移。
+
+### 缓存浏览器接口
+
+`GET /cache`
+
+需要 `HATH_READ_TOKEN`。返回缓存浏览器 HTML 页面。
+
+Query 参数：
+
+- `name`: 可选，初始选中的客户端名称。
+
+`GET /v1/cache`
+
+`GET /cache` 的别名。需要 `HATH_READ_TOKEN`。
+
+`GET /v1/cache/browser`
+
+`GET /cache` 的别名。需要 `HATH_READ_TOKEN`。
+
+`GET /v1/cache/tree`
+
+需要 `HATH_READ_TOKEN`。代理访问选中 H@H 客户端的本地 cache browser list 接口，返回目录/文件列表。
+
+Query 参数：
+
+- `client_ip`: 可选客户端选择器。
+- `name`: 可选客户端选择器。
+- `prefix`: 可选 hex 前缀，0 到 40 个字符；非 hex 会返回 `invalid_prefix`。
+- `limit`: 可选返回数量；默认 500，最大 1000。
+- `offset`: 可选分页偏移；默认 0。
+
+如果没有传 `client_ip` 或 `name`，会使用最近一个 `cache_url` 非空的客户端。
+
+`GET /v1/cache/file`
+
+需要 `HATH_READ_TOKEN`。从选中的 H@H 客户端代理读取单个缓存文件，并以 inline 方式流式返回。
+
+Query 参数：
+
+- `fileid`: 必填，H@H cache file id，格式为 `<40位hex>-<size>[-<x>-<y>]-<type>`。
+- `client_ip`: 可选客户端选择器。
+- `name`: 可选客户端选择器。
+
+`GET /v1/cache/probe`
+
+需要 `HATH_READ_TOKEN`。测试 Worker 是否能访问选中客户端的 cache browser list 接口。
+
+Query 参数：
+
+- `client_ip`: 可选客户端选择器。
+- `name`: 可选客户端选择器。
+
+### Durable Object 内部接口
+
+`POST /ingest` 和 `POST /flush` 只存在于 `HathStatsDurableObject.fetch()` 内部，不是公开 Worker API。外部调用应使用 `/v1/ingest` 和 `/v1/flush`，这两个公开入口会先校验 token，再转发给 Durable Object。
+
+想立即看到最新缓冲数据，可以先执行：
 
 ```text
 POST /v1/flush?all=1
@@ -403,4 +536,3 @@ Invoke-RestMethod -Uri $url
 - 如果查询接口返回 `401`，检查 `HATH_READ_TOKEN`；ingest token 和 read token 是分开的。
 - 如果 Cloudflare 提醒 D1 rows written 接近限制，优先检查是否误部署了旧版逐 event 写入代码。
 - 如果 Cloudflare 提醒 KV operations 接近限制，优先检查当前部署是否仍在使用旧 KV 聚合版本。
-
