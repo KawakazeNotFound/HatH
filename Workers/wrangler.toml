@@ -2,6 +2,9 @@ name = "hath"
 main = "worker.js"
 compatibility_date = "2026-05-02"
 
+[vars]
+HATH_API_URL = "http://sa-arm.0061226.xyz:8789"
+
 [[d1_databases]]
 binding = "HATH_DB"
 database_name = "hath_stats"

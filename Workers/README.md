@@ -1,16 +1,16 @@
 # H@H Cloudflare Worker
 
-This directory contains the Cloudflare Worker used to receive H@H client telemetry, aggregate high-frequency request events, store rolled-up stats in D1, and expose read APIs plus the cache browser UI.
+This directory contains the Cloudflare Worker used to receive H@H client telemetry, aggregate high-frequency request events, store rolled-up stats in either a self-hosted stats API or D1, and expose read APIs plus the cache browser UI.
 
 ## Components
 
 - `worker.js`: Worker entry point, API handlers, cache browser HTML, and the `HathStatsDurableObject` class.
-- `schema.sql`: D1 table schema for persisted client and request statistics.
-- `wrangler.toml`: Cloudflare deployment config, including the D1 binding and Durable Object binding.
+- `schema.sql`: D1 fallback table schema for persisted client and request statistics.
+- `wrangler.toml`: Cloudflare deployment config, including the D1 fallback binding and Durable Object binding.
 
 ## Runtime Architecture
 
-The write path is intentionally split from the read path to avoid exhausting D1 and KV daily limits.
+The write path is intentionally split from the read path to avoid exhausting storage limits.
 
 ```text
 H@H client
@@ -20,11 +20,11 @@ H@H client
   -> in-memory hourly aggregation
   -> Durable Object storage checkpoint
   -> hourly/manual flush
-  -> D1
+  -> self-hosted stats API, or D1 fallback
   -> read APIs and cache browser
 ```
 
-KV is not used by the current design. This is deliberate: writing each ingest request to KV still burns Cloudflare Workers KV operations too quickly. Durable Objects are a better fit because one object can keep hot aggregation state in memory, checkpoint periodically, and flush compact rollups to D1.
+KV is not used by the current design. This is deliberate: writing each ingest request to KV still burns Cloudflare Workers KV operations too quickly. Durable Objects are a better fit because one object can keep hot aggregation state in memory, checkpoint periodically, and flush compact rollups to the configured stats store.
 
 ## Ingest Flow
 
@@ -107,7 +107,7 @@ ips[requester_ip]:
   last_seen_ts
 ```
 
-For example, if the same file is requested 1,000 times in the same hour, the Durable Object keeps one aggregate record with `request_count += 1000` instead of writing 1,000 D1 rows.
+For example, if the same file is requested 1,000 times in the same hour, the Durable Object keeps one aggregate record with `request_count += 1000` instead of writing 1,000 storage rows.
 
 ## Checkpointing
 
@@ -125,13 +125,13 @@ This means a checkpoint happens when either condition is met:
 - at least 60 seconds passed since the previous checkpoint
 - at least 1,000 events were received since the previous checkpoint
 
-This reduces the worst-case loss window if the Durable Object is restarted before the next D1 flush. With the current values, the expected maximum uncheckpointed window is roughly 60 seconds or 1,000 events.
+This reduces the worst-case loss window if the Durable Object is restarted before the next stats-store flush. With the current values, the expected maximum uncheckpointed window is roughly 60 seconds or 1,000 events.
 
 Lowering these values improves durability but increases Durable Object storage writes. Setting the event limit to `1` gives stronger persistence, but it will write DO storage much more often.
 
-## D1 Flush Behavior
+## Flush Behavior
 
-D1 is written only after aggregation, not for every event.
+The configured stats store is written only after aggregation, not for every event.
 
 Flushes happen in these cases:
 
@@ -235,7 +235,7 @@ X-Auth-Token: <HATH_READ_TOKEN>
 
 Important: `worker.js` currently treats a missing secret binding as "auth disabled" for that token type. Make sure both `HATH_INGEST_TOKEN` and `HATH_READ_TOKEN` are configured before exposing the Worker.
 
-Read APIs query D1 only. They do not read the current in-memory Durable Object buffer, so very recent ingest data may not appear until the next hourly/manual flush.
+Read APIs query the configured stats store only. They do not read the current in-memory Durable Object buffer, so very recent ingest data may not appear until the next hourly/manual flush.
 
 ### Write and flush routes
 
@@ -255,7 +255,7 @@ JSON body fields:
 
 `POST /v1/flush`
 
-Requires `HATH_INGEST_TOKEN`. Flushes buffered Durable Object data to D1.
+Requires `HATH_INGEST_TOKEN`. Flushes buffered Durable Object data to the configured stats store.
 
 Query parameters:
 
@@ -378,7 +378,22 @@ then query the read API again.
 
 ## Cloudflare Bindings
 
-`wrangler.toml` must contain:
+The Worker can run in self-hosted API mode or D1 fallback mode.
+
+Self-hosted API mode:
+
+```toml
+[vars]
+HATH_API_URL = "https://your-api.example.com"
+```
+
+Set the shared API token as a secret:
+
+```powershell
+npx wrangler secret put HATH_API_TOKEN
+```
+
+D1 fallback mode requires:
 
 ```toml
 [[d1_databases]]
@@ -402,6 +417,7 @@ Secrets:
 ```text
 HATH_INGEST_TOKEN
 HATH_READ_TOKEN
+HATH_API_TOKEN   # only when HATH_API_URL is configured
 ```
 
 Set them with:

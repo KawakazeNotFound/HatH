@@ -4,6 +4,7 @@ const JSON_HEADERS = {"Content-Type": "application/json"};
 const HTML_HEADERS = {"Content-Type": "text/html; charset=utf-8"};
 const STATS_FLUSH_INTERVAL_S = 3600;
 const D1_BATCH_SIZE = 50;
+const STATS_API_BATCH_SIZE = 500;
 const DO_CHECKPOINT_INTERVAL_S = 60;
 const DO_CHECKPOINT_EVENT_LIMIT = 1000;
 
@@ -198,6 +199,89 @@ function getClientIp(request) {
 	return realIp || "unknown";
 }
 
+function hasStatsApi(env) {
+	return !!(env.HATH_API_URL && String(env.HATH_API_URL).length > 0);
+}
+
+function hasStatsStore(env) {
+	return hasStatsApi(env) || !!env.HATH_DB;
+}
+
+function statsStoreMissingResponse() {
+	return jsonResponse({ error: "missing_stats_store" }, 500);
+}
+
+function getStatsApiUrl(env, path) {
+	const base = String(env.HATH_API_URL || "").replace(/\/+$/, "");
+	return base + path;
+}
+
+function getStatsApiHeaders(env) {
+	const headers = new Headers({ "Accept": "application/json" });
+	const token = env.HATH_API_TOKEN || "";
+	if(token) {
+		headers.set("Authorization", "Bearer " + token);
+	}
+	return headers;
+}
+
+async function callStatsApi(env, path, options) {
+	const headers = getStatsApiHeaders(env);
+	let body = null;
+	if(options && options.body !== undefined) {
+		headers.set("Content-Type", "application/json");
+		body = JSON.stringify(options.body);
+	}
+
+	const res = await fetch(getStatsApiUrl(env, path), {
+		method: (options && options.method) || "GET",
+		headers: headers,
+		body: body
+	});
+
+	const text = await res.text();
+	let data = {};
+	if(text) {
+		try {
+			data = JSON.parse(text);
+		}
+		catch(e) {
+			data = { error: "invalid_api_json", detail: text.substring(0, 500) };
+		}
+	}
+
+	if(!res.ok) {
+		const err = new Error(data.error || "stats_api_error");
+		err.status = res.status;
+		err.data = data;
+		throw err;
+	}
+
+	return data;
+}
+
+async function proxyStatsApiJson(env, path) {
+	try {
+		const data = await callStatsApi(env, path);
+		return jsonResponse(data);
+	}
+	catch(e) {
+		return jsonResponse(e.data || { error: e.message || "stats_api_error" }, e.status || 502);
+	}
+}
+
+function copyQuery(request, path, names) {
+	const input = new URL(request.url);
+	const output = new URL("https://hath.internal" + path);
+	for(const name of names) {
+		const value = input.searchParams.get(name);
+		if(value !== null) {
+			output.searchParams.set(name, value);
+		}
+	}
+	return output.pathname + output.search;
+}
+
 function requireStatsDo(env) {
 	return env.HATH_STATS ? null : jsonResponse({ error: "missing_durable_object" }, 500);
 }
@@ -264,6 +348,37 @@ function bindStatStatement(env, table, clientIp, key, row) {
 async function flushStatsAggregate(env, clientIp, aggregate) {
 	if(!aggregate || !aggregate.client_ip) {
 		return 0;
+	}
+
+	if(hasStatsApi(env)) {
+		let written = 0;
+		const fileIds = Object.keys(aggregate.files || {});
+		for(let i = 0; i < fileIds.length; i += STATS_API_BATCH_SIZE) {
+			const files = {};
+			for(const fileId of fileIds.slice(i, i + STATS_API_BATCH_SIZE)) {
+				files[fileId] = aggregate.files[fileId];
+			}
+			const result = await callStatsApi(env, "/v1/stats/aggregate", {
+				method: "POST",
+				body: { client_ip: clientIp, files: files, ips: {} }
+			});
+			written += Number(result.stat_writes || 0);
+		}
+
+		const ips = Object.keys(aggregate.ips || {});
+		for(let i = 0; i < ips.length; i += STATS_API_BATCH_SIZE) {
+			const ipRows = {};
+			for(const ip of ips.slice(i, i + STATS_API_BATCH_SIZE)) {
+				ipRows[ip] = aggregate.ips[ip];
+			}
+			const result = await callStatsApi(env, "/v1/stats/aggregate", {
+				method: "POST",
+				body: { client_ip: clientIp, files: {}, ips: ipRows }
+			});
+			written += Number(result.stat_writes || 0);
+		}
+
+		return written;
 	}
 
 	const stmts = [];
@@ -338,6 +453,14 @@ function buildClientRecord(body, clientIp, now) {
 }
 
 async function writeClientRecord(env, row) {
+	if(hasStatsApi(env)) {
+		await callStatsApi(env, "/v1/clients/upsert", {
+			method: "POST",
+			body: row
+		});
+		return;
+	}
+
 	await env.HATH_DB.prepare(
 		"INSERT INTO clients (client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
 		"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) " +
@@ -382,22 +505,22 @@ async function queueClientRecord(env, clients, row) {
 }
 
 async function handleIngest(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
 	}
 	return forwardToStatsDo(request, env, "/ingest");
 }
 
 async function handleFlush(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
 	}
 	return forwardToStatsDo(request, env, "/flush");
 }
 
 async function handleRefresh(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
 	}
 
 	const url = new URL(request.url);
@@ -410,8 +533,12 @@ async function handleRefresh(request, env) {
 }
 
 async function handleOverview(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
+	}
+
+	if(hasStatsApi(env)) {
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/overview", ["tz"]));
 	}
 
 	const now = Math.floor(Date.now() / 1000);
@@ -494,8 +621,12 @@ async function handleOverview(request, env) {
 }
 
 async function handleClients(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
+	}
+
+	if(hasStatsApi(env)) {
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/clients", ["limit", "tz"]));
 	}
 
 	const url = new URL(request.url);
@@ -510,8 +641,12 @@ async function handleClients(request, env) {
 }
 
 async function handleTopFiles(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
+	}
+
+	if(hasStatsApi(env)) {
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/top/files", ["client_ip", "name", "limit", "tz"]));
 	}
 
 	const url = new URL(request.url);
@@ -536,8 +671,12 @@ async function handleTopFiles(request, env) {
 }
 
 async function handleTopIps(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
+	}
+
+	if(hasStatsApi(env)) {
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/top/ips", ["client_ip", "name", "limit", "tz"]));
 	}
 
 	const url = new URL(request.url);
@@ -565,6 +704,19 @@ async function resolveClient(request, env) {
 	const clientIp = url.searchParams.get("client_ip");
 	const name = url.searchParams.get("name");
 
+	if(hasStatsApi(env)) {
+		const path = copyQuery(request, "/v1/client/resolve", ["client_ip", "name"]);
+		try {
+			return await callStatsApi(env, path);
+		}
+		catch(e) {
+			if(e.status === 404) {
+				return null;
+			}
+			throw e;
+		}
+	}
+
 	if(clientIp) {
 		const res = await env.HATH_DB.prepare("SELECT client_ip, name, cache_url FROM clients WHERE client_ip = ? LIMIT 1").bind(clientIp).all();
 		return res.results && res.results[0] ? res.results[0] : null;
@@ -580,12 +732,18 @@ async function resolveClient(request, env) {
 }
 
 async function handleCacheTree(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
 	}
 
 	const url = new URL(request.url);
-	const client = await resolveClient(request, env);
+	let client;
+	try {
+		client = await resolveClient(request, env);
+	}
+	catch(e) {
+		return jsonResponse(e.data || { error: e.message || "stats_api_error" }, e.status || 502);
+	}
 	if(!client) {
 		return jsonResponse({ error: "missing_client" }, 400);
 	}
@@ -626,8 +784,8 @@ async function handleCacheTree(request, env) {
 }
 
 async function handleCacheFile(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
 	}
 
 	const url = new URL(request.url);
@@ -636,7 +794,13 @@ async function handleCacheFile(request, env) {
 		return jsonResponse({ error: "invalid_fileid" }, 400);
 	}
 
-	const client = await resolveClient(request, env);
+	let client;
+	try {
+		client = await resolveClient(request, env);
+	}
+	catch(e) {
+		return jsonResponse(e.data || { error: e.message || "stats_api_error" }, e.status || 502);
+	}
 	if(!client) {
 		return jsonResponse({ error: "missing_client" }, 400);
 	}
@@ -670,11 +834,17 @@ async function handleCacheFile(request, env) {
 }
 
 async function handleCacheProbe(request, env) {
-	if(!env.HATH_DB) {
-		return jsonResponse({ error: "missing_db" }, 500);
+	if(!hasStatsStore(env)) {
+		return statsStoreMissingResponse();
 	}
 
-	const client = await resolveClient(request, env);
+	let client;
+	try {
+		client = await resolveClient(request, env);
+	}
+	catch(e) {
+		return jsonResponse(e.data || { error: e.message || "stats_api_error" }, e.status || 502);
+	}
 	if(!client) {
 		return jsonResponse({ error: "missing_client" }, 400);
 	}
@@ -888,9 +1058,9 @@ export class HathStatsDurableObject {
 }
 
 function getDashboardHtml(request) {
-	const tokenParam = getReadTokenParam(request);
-	const token = tokenParam.startsWith("&token=") ? tokenParam.substring(7) : "";
-	return dashboardHtmlRaw.replace("{{AUTH_TOKEN}}", token);
+	const url = new URL(request.url);
+	const token = url.searchParams.get("token") || "";
+	return dashboardHtmlRaw.replace("\"{{AUTH_TOKEN}}\"", () => jsString(token));
 }
 
 function getCacheBrowserHtml(request) {
