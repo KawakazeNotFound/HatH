@@ -148,7 +148,7 @@ function parseCacheUrl(cacheUrl) {
 
 	try {
 		const url = new URL(cacheUrl);
-		let token = "";
+		let token = url.searchParams.get("token") || "";
 		for(const part of url.pathname.split("/")) {
 			if(part.startsWith("token=")) {
 				token = part.substring(6);
@@ -176,7 +176,7 @@ function buildClientPath(cacheRef, action, params) {
 
 	let url = parts.join("/");
 	if(cacheRef.token) {
-		url += (action === "list" && params ? ";" : "/") + "token=" + cacheRef.token;
+		url += (action === "list" && params ? ";" : "/") + "token=" + encodeURIComponent(cacheRef.token);
 	}
 	return url;
 }
@@ -391,6 +391,20 @@ async function handleFlush(request, env) {
 		return jsonResponse({ error: "missing_db" }, 500);
 	}
 	return forwardToStatsDo(request, env, "/flush");
+}
+
+async function handleRefresh(request, env) {
+	if(!env.HATH_DB) {
+		return jsonResponse({ error: "missing_db" }, 500);
+	}
+
+	const url = new URL(request.url);
+	url.searchParams.set("all", "1");
+	const refreshRequest = new Request(url.toString(), {
+		method: "POST",
+		headers: request.headers
+	});
+	return forwardToStatsDo(refreshRequest, env, "/flush");
 }
 
 async function handleOverview(request, env) {
@@ -649,6 +663,49 @@ async function handleCacheFile(request, env) {
 	return new Response(upstream.body, { status: 200, headers: headers });
 }
 
+async function handleCacheProbe(request, env) {
+	if(!env.HATH_DB) {
+		return jsonResponse({ error: "missing_db" }, 500);
+	}
+
+	const client = await resolveClient(request, env);
+	if(!client) {
+		return jsonResponse({ error: "missing_client" }, 400);
+	}
+
+	const cacheRef = parseCacheUrl(client.cache_url);
+	if(!cacheRef) {
+		return jsonResponse({ error: "missing_cache_url", cache_url: client.cache_url || "" }, 400);
+	}
+
+	const clientUrl = buildClientPath(cacheRef, "list", "prefix=;limit=1;offset=0");
+	let upstream;
+	try {
+		upstream = await fetch(clientUrl, { headers: { "Accept": "application/json" } });
+	}
+	catch(e) {
+		return jsonResponse({
+			ok: false,
+			error: "client_fetch_failed",
+			detail: e.message || String(e),
+			client: { name: client.name, client_ip: client.client_ip },
+			cache_url: client.cache_url || "",
+			fetch_url: clientUrl
+		}, 502);
+	}
+
+	const body = await upstream.text();
+	return jsonResponse({
+		ok: upstream.ok,
+		status: upstream.status,
+		content_type: upstream.headers.get("Content-Type") || "",
+		body_sample: body.substring(0, 500),
+		client: { name: client.name, client_ip: client.client_ip },
+		cache_url: client.cache_url || "",
+		fetch_url: clientUrl
+	}, upstream.ok ? 200 : 502);
+}
+
 export class HathStatsDurableObject {
 	constructor(state, env) {
 		this.state = state;
@@ -829,18 +886,18 @@ function getCacheBrowserHtml(request) {
 	const tokenParam = getReadTokenParam(request);
 	const initialName = url.searchParams.get("name") || "";
 	return `<!doctype html>
-<html><head><meta charset="utf-8"><title>H@H Cache Browser</title>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>H@H Cache Browser</title>
 <style>
 :root{color-scheme:dark;--bg:#232323;--fg:#eee;--muted:#93a19b;--title:#9bd48f;--bar:#443f3f;--link:#f0e6c8;--tag:#6aa5a4;--size:#92be82;--line:#343434}
 body.light{color-scheme:light;--bg:#f6f4ef;--fg:#252525;--muted:#66736e;--title:#367c45;--bar:#ddd8d0;--link:#29323a;--tag:#6ba6a6;--size:#79a96d;--line:#ded8cd}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:Arial,Helvetica,sans-serif;font-size:15px}.wrap{max-width:980px;margin:42px auto 28px;padding:0 28px}h1{margin:0 0 22px;color:var(--title);font-size:46px;font-weight:300}.bar{display:flex;gap:22px;align-items:center;flex-wrap:wrap;background:var(--bar);border-radius:8px;padding:13px 18px;margin-bottom:18px}select,input[type=text]{background:transparent;color:var(--fg);border:1px solid var(--muted);border-radius:4px;padding:4px 8px}button{background:transparent;color:var(--link);border:1px solid var(--muted);border-radius:4px;padding:4px 9px;cursor:pointer}.path{color:var(--muted);margin-left:auto}.path code{color:var(--link)}.entry{display:grid;grid-template-columns:34px minmax(0,1fr) auto auto auto;gap:10px;align-items:center;min-height:42px}.entry:hover{background:rgba(255,255,255,.04)}body.light .entry:hover{background:rgba(0,0,0,.04)}a{color:var(--link);text-decoration:none}.name{overflow-wrap:anywhere}.sub{display:block;margin-top:2px;color:var(--muted);font-size:12px}.pill{display:inline-block;border-radius:4px;padding:3px 7px;color:#fff;background:var(--tag);font-size:12px}.bytes{background:var(--size)}.icon{position:relative;width:25px;height:23px;display:inline-block}.folder:before{content:'';position:absolute;left:1px;top:7px;width:23px;height:14px;border:2px solid #77a7bc;border-radius:2px}.folder:after{content:'';position:absolute;left:3px;top:3px;width:10px;height:6px;border:2px solid #77a7bc;border-bottom:0}.file:before{content:'';position:absolute;left:5px;top:1px;width:15px;height:21px;border:2px solid #8db3c2}.file:after{content:'';position:absolute;left:9px;top:7px;width:8px;height:2px;background:#8db3c2;box-shadow:0 5px 0 #8db3c2,0 10px 0 #8db3c2}.up{font-size:28px;color:#75a2b6}.preview{margin-top:28px;padding-top:20px;border-top:1px solid var(--line)}.preview img,.preview video{display:block;max-width:100%;max-height:72vh;background:#000;border-radius:4px}.caption{color:var(--muted);margin-bottom:10px}.footer{margin-top:34px;text-align:center;color:var(--muted);font-size:12px}@media(max-width:640px){.wrap{margin-top:24px;padding:0 16px}h1{font-size:36px}.entry{grid-template-columns:30px minmax(0,1fr)}.entry .pill,.entry .age{display:none}.path{width:100%;margin-left:0}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font-family:Arial,Helvetica,sans-serif;font-size:15px}.wrap{max-width:1480px;margin:34px auto 28px;padding:0 24px}h1{margin:0 0 18px;color:var(--title);font-size:40px;font-weight:300}.layout{display:grid;grid-template-columns:minmax(440px,1fr) minmax(360px,42%);gap:20px;align-items:start}.bar{display:flex;gap:18px;align-items:center;flex-wrap:wrap;background:var(--bar);border-radius:8px;padding:13px 18px;margin-bottom:18px}select,input[type=text]{background:transparent;color:var(--fg);border:1px solid var(--muted);border-radius:4px;padding:4px 8px}button{background:transparent;color:var(--link);border:1px solid var(--muted);border-radius:4px;padding:4px 9px;cursor:pointer}.path{color:var(--muted);margin-left:auto}.path code{color:var(--link)}.list{min-width:0}.entry{display:grid;grid-template-columns:34px minmax(0,1fr) auto auto auto;gap:10px;align-items:center;min-height:42px}.entry:hover{background:rgba(255,255,255,.04)}body.light .entry:hover{background:rgba(0,0,0,.04)}a{color:var(--link);text-decoration:none}.name{overflow-wrap:anywhere}.sub{display:block;margin-top:2px;color:var(--muted);font-size:12px}.pill{display:inline-block;border-radius:4px;padding:3px 7px;color:#fff;background:var(--tag);font-size:12px}.bytes{background:var(--size)}.icon{position:relative;width:25px;height:23px;display:inline-block}.folder:before{content:'';position:absolute;left:1px;top:7px;width:23px;height:14px;border:2px solid #77a7bc;border-radius:2px}.folder:after{content:'';position:absolute;left:3px;top:3px;width:10px;height:6px;border:2px solid #77a7bc;border-bottom:0}.file:before{content:'';position:absolute;left:5px;top:1px;width:15px;height:21px;border:2px solid #8db3c2}.file:after{content:'';position:absolute;left:9px;top:7px;width:8px;height:2px;background:#8db3c2;box-shadow:0 5px 0 #8db3c2,0 10px 0 #8db3c2}.up{font-size:28px;color:#75a2b6}.preview{position:sticky;top:20px;min-height:360px;background:rgba(0,0,0,.12);border:1px solid var(--line);border-radius:6px;padding:14px;overflow:hidden}.preview img,.preview video{display:block;width:100%;max-height:calc(100vh - 130px);object-fit:contain;background:#000;border-radius:4px}.caption{color:var(--muted);margin-bottom:10px;overflow-wrap:anywhere}.empty{height:320px;display:grid;place-items:center;color:var(--muted);border:1px dashed var(--line);border-radius:4px}.footer{margin-top:34px;text-align:center;color:var(--muted);font-size:12px}@media(max-width:900px){.wrap{margin-top:24px;padding:0 16px}h1{font-size:36px}.layout{display:block}.preview{position:static;margin-top:18px}.entry{grid-template-columns:30px minmax(0,1fr)}.entry .pill,.entry .age{display:none}.path{width:100%;margin-left:0}}
 </style></head><body><main class="wrap"><h1>File Browser</h1>
 <section class="bar">
 <label>client: <select id="client"></select></label>
 <label>sort list by: <input type="radio" name="sort" value="date" checked onchange="renderList()"> date <input type="radio" name="sort" value="name" onchange="renderList()"> name <input type="radio" name="sort" value="size" onchange="renderList()"> size</label>
 <label>theme: <input type="radio" name="theme" value="light" onchange="setTheme(this.value)"> light <input type="radio" name="theme" value="dark" checked onchange="setTheme(this.value)"> dark</label>
-<label>prefix: <input id="prefix" type="text" placeholder="e03c"></label><button onclick="goPrefix()">open</button><span class="path">/cache/<code id="path"></code></span>
-</section><section id="list"></section><section id="preview" class="preview"></section><div class="footer">H@H cache browser via Worker</div></main>
+<label>prefix: <input id="prefix" type="text" placeholder="e03c"></label><button onclick="goPrefix()">open</button><button onclick="refreshData()">refresh</button><span class="path">/cache/<code id="path"></code></span>
+</section><div class="layout"><section id="list" class="list"></section><aside id="preview" class="preview"><div class="empty">Select a file to preview.</div></aside></div><div class="footer">H@H cache browser via Worker</div></main>
 <script>
 const auth='${tokenParam}';const initialName=${jsString(initialName)};let currentPrefix='',currentItems=[],currentDirectUrls={},nextOffset=null,offset=0;const limit=500;
 function qs(){const c=document.getElementById('client').value;return 'name='+encodeURIComponent(c)+auth;}
@@ -852,9 +909,10 @@ function setTheme(v){document.body.className=v==='light'?'light':'';}
 function parentPrefix(){if(currentPrefix.length>=4)return currentPrefix.substring(0,2);if(currentPrefix.length>=2)return '';return null;}
 function goPrefix(){openPrefix(document.getElementById('prefix').value.trim().toLowerCase());}
 async function loadClients(){const res=await fetch('/v1/clients?'+auth.substring(1));const data=await res.json();const sel=document.getElementById('client');sel.innerHTML='';for(const c of data.clients||[]){const o=document.createElement('option');o.value=c.name||c.client_ip;o.textContent=(c.name||c.client_ip)+(c.cache_url?'':' (no cache url)');sel.appendChild(o);}if(initialName){sel.value=initialName;}sel.onchange=()=>openPrefix('');if(sel.value){await openPrefix('');}else{document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>No clients found.</span><span></span><span></span><span></span></div>';}}
-async function openPrefix(prefix,append){if(!append){offset=0;currentItems=[];currentDirectUrls={};}currentPrefix=prefix||'';document.getElementById('prefix').value=currentPrefix;document.getElementById('path').textContent=currentPrefix?currentPrefix.match(/.{1,2}/g).join('/')+'/':'';const res=await fetch('/v1/cache/tree?'+qs()+'&prefix='+currentPrefix+'&limit='+limit+'&offset='+offset);const data=await res.json();if(data.error){const direct=data.direct_url?' <a href="'+esc(data.direct_url)+'" target="_blank" rel="noopener">open direct</a>':'';document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>'+esc(data.error)+direct+'</span><span></span><span></span><span></span></div>';return;}for(const item of data.items||[]){if(item.type==='file'&&item.direct_url){currentDirectUrls[item.fileid]=item.direct_url;}}currentItems=currentItems.concat(data.items||[]);nextOffset=data.next_offset;renderList();}
-function renderList(){const list=document.getElementById('list');let items=currentItems.slice();const mode=sortMode();items.sort((a,b)=>a.type!==b.type?a.type==='dir'?-1:1:mode==='size'?(b.size||0)-(a.size||0):mode==='date'?(b.last_modified||0)-(a.last_modified||0):String(a.name||a.display_name||a.fileid).localeCompare(String(b.name||b.display_name||b.fileid)));let html='';const parent=parentPrefix();if(parent!==null){html+='<div class=entry><span class=up>&#8634;</span><a class=name href=# onclick="openPrefix(\\''+parent+'\\');return false;">..</a><span></span><span></span><span></span></div>';}for(const item of items){if(item.type==='dir'){html+='<div class=entry><span class="icon folder"></span><a class=name href=# onclick="openPrefix(\\''+esc(item.prefix)+'\\');return false;">'+esc(item.name)+'</a><span class=pill>folder</span><span></span><span></span></div>';}else{html+='<div class=entry><span class="icon file"></span><a class=name href=# onclick="preview(\\''+esc(item.fileid)+'\\',\\''+esc(item.mime)+'\\');return false;">'+esc(item.display_name||item.fileid)+'<span class=sub>'+esc(item.fileid)+'</span></a><span class=pill>'+esc(item.extension||item.mime)+'</span><span class="pill bytes">'+size(item.size)+'</span><span class="sub age">'+age(item.last_modified)+'</span></div>';}}if(nextOffset!==null){html+='<div style="margin-top:16px"><button onclick="offset=nextOffset;openPrefix(currentPrefix,true)">load more</button></div>';}list.innerHTML=html;}
-function preview(fileid,mime){const url='/v1/cache/file?'+qs()+'&fileid='+encodeURIComponent(fileid);const direct=currentDirectUrls[fileid]||'';const directLink=direct?' <a href="'+esc(direct)+'" target="_blank" rel="noopener">open direct</a>':'';const box=document.getElementById('preview');const cap='<div class=caption>'+esc(fileid)+directLink+'</div>';box.innerHTML=mime.startsWith('video/')?cap+'<video controls src="'+url+'"></video>':cap+'<img src="'+url+'" />';const media=box.querySelector('img,video');if(media){media.onerror=()=>{box.innerHTML=direct?'<div class=caption>Proxy failed. '+directLink+'</div>':'<div class=caption>Proxy failed.</div>';};}box.scrollIntoView({block:'nearest'});}
+async function refreshData(){const r=await fetch('/v1/refresh?'+auth.substring(1),{method:'POST'});const data=await r.json();if(!r.ok||data.error){document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>refresh failed<span class=sub>'+esc(data.error||data.detail||r.status)+'</span></span><span></span><span></span><span></span></div>';return;}await loadClients();}
+async function openPrefix(prefix,append){if(!append){offset=0;currentItems=[];currentDirectUrls={};}currentPrefix=prefix||'';document.getElementById('prefix').value=currentPrefix;document.getElementById('path').textContent=currentPrefix?currentPrefix.match(/.{1,2}/g).join('/')+'/':'';const res=await fetch('/v1/cache/tree?'+qs()+'&prefix='+currentPrefix+'&limit='+limit+'&offset='+offset);const data=await res.json();if(data.error){const direct=data.direct_url?' <a href="'+esc(data.direct_url)+'" target="_blank" rel="noopener">open direct</a>':'';const more=[data.status?'status='+data.status:'',data.detail?'detail='+data.detail:''].filter(Boolean).join(' | ');document.getElementById('list').innerHTML='<div class=entry><span></span><span class=name>'+esc(data.error)+direct+(more?'<span class=sub>'+esc(more)+'</span>':'')+'</span><span></span><span></span><span></span></div>';return;}for(const item of data.items||[]){if(item.type==='file'&&item.direct_url){currentDirectUrls[item.fileid]=item.direct_url;}}currentItems=currentItems.concat(data.items||[]);nextOffset=data.next_offset;renderList();}
+function renderList(){const list=document.getElementById('list');let items=currentItems.slice();const mode=sortMode();items.sort((a,b)=>a.type!==b.type?a.type==='dir'?-1:1:mode==='size'?(b.size||0)-(a.size||0):mode==='date'?(b.last_modified||0)-(a.last_modified||0):String(a.name||a.display_name||a.fileid).localeCompare(String(b.name||b.display_name||b.fileid)));let html='';const parent=parentPrefix();if(parent!==null){html+='<div class=entry><span class=up>&#8634;</span><a class=name href=# onclick="openPrefix(\\''+parent+'\\');return false;">..</a><span></span><span></span><span></span></div>';}let folderCount=0;let fileCount=0;for(const item of items){if(item.type==='dir'){folderCount++;html+='<div class=entry><span class="icon folder"></span><a class=name href=# onclick="openPrefix(\\''+esc(item.prefix)+'\\');return false;">'+esc(item.name)+'</a><span class=pill>folder</span><span></span><span></span></div>';}else{fileCount++;html+='<div class=entry><span class="icon file"></span><a class=name href=# onclick="preview(\\''+esc(item.fileid)+'\\',\\''+esc(item.mime)+'\\');return false;">'+esc(item.display_name||item.fileid)+'<span class=sub>'+esc(item.fileid)+'</span></a><span class=pill>'+esc(item.extension||item.mime)+'</span><span class="pill bytes">'+size(item.size)+'</span><span class="sub age">'+age(item.last_modified)+'</span></div>';}}if(folderCount||fileCount){html+='<div style="margin-top:16px;color:var(--muted);font-size:12px;padding:0 8px;">'+(folderCount?folderCount+' folder(s)':'')+(folderCount&&fileCount?', ':'')+(fileCount?fileCount+' file(s)':'')+'</div>';}if(nextOffset!=null){html+='<div style="margin-top:16px"><button onclick="offset=nextOffset;openPrefix(currentPrefix,true)">load more</button></div>';}list.innerHTML=html;}
+function preview(fileid,mime){const url='/v1/cache/file?'+qs()+'&fileid='+encodeURIComponent(fileid);const direct=currentDirectUrls[fileid]||'';const directLink=direct?' <a href="'+esc(direct)+'" target="_blank" rel="noopener">open direct</a>':'';const box=document.getElementById('preview');const cap='<div class=caption>'+esc(fileid)+directLink+'</div>';box.innerHTML=mime.startsWith('video/')?cap+'<video controls src="'+url+'"></video>':cap+'<img src="'+url+'" />';const media=box.querySelector('img,video');if(media){media.onerror=()=>{box.innerHTML=direct?'<div class=caption>Proxy failed. '+directLink+'</div>':'<div class=caption>Proxy failed.</div>';};}}
 loadClients();
 </script></body></html>`;
 }
@@ -887,6 +945,14 @@ export default {
 			return handleCacheFile(request, env);
 		}
 
+		if(request.method === "GET" && url.pathname === "/v1/cache/probe") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return handleCacheProbe(request, env);
+		}
+
 		if(request.method === "POST" && url.pathname === "/v1/ingest") {
 			const authError = requireAuth(request, env, "HATH_INGEST_TOKEN", false);
 			if(authError) {
@@ -901,6 +967,14 @@ export default {
 				return authError;
 			}
 			return handleFlush(request, env);
+		}
+
+		if((request.method === "GET" || request.method === "POST") && url.pathname === "/v1/refresh") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return handleRefresh(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/overview") {
