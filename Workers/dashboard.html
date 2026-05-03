@@ -34,9 +34,17 @@
 
         header {
             margin-bottom: 60px;
-            text-align: center;
             border-bottom: 2px solid var(--border);
             padding-bottom: 30px;
+        }
+
+        .header-top {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 20px;
         }
 
         h1 {
@@ -376,6 +384,13 @@
             overflow-y: auto;
         }
 
+        .window-img-container {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: #000;
+        }
+
         .window-img-container img {
             max-width: 100%;
             max-height: 70vh;
@@ -443,7 +458,10 @@
 <body>
     <div class="container">
         <header>
-            <h1>DATA::SYSTEM::OVERVIEW</h1>
+            <div class="header-top">
+                <h1>DATA::SYSTEM::OVERVIEW</h1>
+                <button id="refresh-btn" class="window-action" onclick="manualRefresh()" style="font-size: 1.1rem; padding: 10px 20px;">REFRESH SYSTEM</button>
+            </div>
             <div id="global-stats" class="global-stats">
                 <!-- Global stats injected here -->
             </div>
@@ -486,6 +504,12 @@
 
     <script>
         const AUTH_TOKEN = "{{AUTH_TOKEN}}";
+        
+        // Persist token in cookie if provided in URL
+        if (AUTH_TOKEN && AUTH_TOKEN !== "{"+"{AUTH_TOKEN}}") {
+            document.cookie = `hath_token=${encodeURIComponent(AUTH_TOKEN)}; path=/; max-age=31536000; SameSite=Strict`;
+        }
+
         const previewWindow = document.getElementById('file-preview-window');
         const previewImg = document.getElementById('preview-img');
         const previewHeaderText = document.getElementById('preview-header-text');
@@ -497,6 +521,31 @@
         const imgSearchBtn = document.getElementById('imgsearch-btn');
         let currentModalFileId = '';
         let currentModalClientName = '';
+
+        function getAuthQuery() {
+            return (AUTH_TOKEN && AUTH_TOKEN !== "{"+"{AUTH_TOKEN}}") ? `&token=${encodeURIComponent(AUTH_TOKEN)}` : '';
+        }
+
+        async function manualRefresh() {
+            const btn = document.getElementById('refresh-btn');
+            const oldText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = 'REFRESHING...';
+            try {
+                const response = await fetch(`/v1/refresh?all=1${getAuthQuery()}`, { method: 'POST' });
+                if (!response.ok) throw new Error(`HTTP_${response.status}`);
+                await fetchData();
+                btn.textContent = 'SUCCESS';
+                setTimeout(() => {
+                    btn.textContent = oldText;
+                    btn.disabled = false;
+                }, 2000);
+            } catch (err) {
+                alert(`REFRESH_FAILED::${err.message}`);
+                btn.textContent = 'FAILED';
+                btn.disabled = false;
+            }
+        }
 
         document.addEventListener('mousemove', (e) => {
             if (previewWindow.style.display === 'block') {
@@ -527,7 +576,7 @@
             loadingText.style.display = 'block';
             loadingText.textContent = `FETCHING_DATA::${fileid.substring(0,8)}...`;
 
-            const url = `/v1/cache/file?fileid=${encodeURIComponent(fileid)}&name=${encodeURIComponent(clientName)}&token=${encodeURIComponent(AUTH_TOKEN)}`;
+            const url = `/v1/cache/file?fileid=${encodeURIComponent(fileid)}&name=${encodeURIComponent(clientName)}${getAuthQuery()}`;
             
             previewImg.onload = () => {
                 loadingText.style.display = 'none';
@@ -555,7 +604,7 @@
             imgSearchBtn.disabled = false;
             imgSearchBtn.textContent = 'IMGSEARCH';
             hologramModal.style.display = 'flex';
-            modalImg.src = `/v1/cache/file?fileid=${encodeURIComponent(fileid)}&name=${encodeURIComponent(clientName)}&token=${encodeURIComponent(AUTH_TOKEN)}`;
+            modalImg.src = `/v1/cache/file?fileid=${encodeURIComponent(fileid)}&name=${encodeURIComponent(clientName)}${getAuthQuery()}`;
             
             modalFooter.innerHTML = `
                 <div class="footer-item">
@@ -588,7 +637,7 @@
             imgSearchBtn.disabled = true;
             imgSearchBtn.textContent = 'SEARCHING';
             try {
-                const url = `/v1/imgsearch?fileid=${encodeURIComponent(currentModalFileId)}&name=${encodeURIComponent(currentModalClientName)}&token=${encodeURIComponent(AUTH_TOKEN)}`;
+                const url = `/v1/imgsearch?fileid=${encodeURIComponent(currentModalFileId)}&name=${encodeURIComponent(currentModalClientName)}${getAuthQuery()}`;
                 const response = await fetch(url, { method: 'POST' });
                 const data = await response.json();
                 if (!data.search_url) {
@@ -689,8 +738,8 @@
 
         async function fetchData() {
             try {
-                const response = await fetch(`/v1/overview?token=${encodeURIComponent(AUTH_TOKEN)}`);
-                if (!response.ok) throw new Error('CONNECTION_FAILURE');
+                const response = await fetch(`/v1/overview?tz=${new Date().getTimezoneOffset()}${getAuthQuery()}`);
+                if (!response.ok) throw new Error(`HTTP_${response.status}`);
                 const data = await response.json();
                 renderDashboard(data);
             } catch (err) {
