@@ -533,9 +533,19 @@
         let currentModalFileId = '';
         let currentModalClientName = '';
         let autoRefreshAfterNoDataTried = false;
+        const overviewCache = new Map();
+        let overviewRequestSeq = 0;
 
         function getAuthQuery() {
             return (AUTH_TOKEN && AUTH_TOKEN !== "{"+"{AUTH_TOKEN}}") ? `&token=${encodeURIComponent(AUTH_TOKEN)}` : '';
+        }
+
+        function selectedRange() {
+            return document.getElementById('range').value;
+        }
+
+        function clearOverviewCache() {
+            overviewCache.clear();
         }
 
         async function manualRefresh() {
@@ -544,9 +554,11 @@
             btn.disabled = true;
             btn.textContent = 'REFRESHING...';
             try {
+                clearOverviewCache();
+                autoRefreshAfterNoDataTried = false;
                 const response = await fetch(`/v1/refresh?all=1${getAuthQuery()}`, { method: 'POST' });
                 if (!response.ok) throw new Error(`HTTP_${response.status}`);
-                await fetchData();
+                await fetchData({ force: true, allowAutoRefresh: false });
                 btn.textContent = 'SUCCESS';
                 setTimeout(() => {
                     btn.textContent = oldText;
@@ -566,7 +578,8 @@
             try {
                 const response = await fetch(`/v1/refresh?all=1${getAuthQuery()}`, { method: 'POST' });
                 if (response.ok) {
-                    await fetchData();
+                    clearOverviewCache();
+                    await fetchData({ force: true, allowAutoRefresh: false });
                 }
             } catch (err) {
                 console.warn(`AUTO_REFRESH_FAILED::${err.message}`);
@@ -762,19 +775,32 @@
             `;
         }
 
-        async function fetchData() {
+        async function fetchData(options = {}) {
+            const range = selectedRange();
+            if (!options.force && overviewCache.has(range)) {
+                renderDashboard(overviewCache.get(range), options);
+                return;
+            }
+
+            const requestSeq = ++overviewRequestSeq;
             try {
-                const range = document.getElementById('range').value;
                 const response = await fetch(`/v1/overview?tz=${new Date().getTimezoneOffset()}&range=${range}${getAuthQuery()}`);
                 if (!response.ok) throw new Error(`HTTP_${response.status}`);
                 const data = await response.json();
-                renderDashboard(data);
+                overviewCache.set(range, data);
+                if (requestSeq !== overviewRequestSeq || selectedRange() !== range) {
+                    return;
+                }
+                renderDashboard(data, options);
             } catch (err) {
+                if (requestSeq !== overviewRequestSeq || selectedRange() !== range) {
+                    return;
+                }
                 document.getElementById('content').innerHTML = `<div class="error">ERROR: ${err.message}</div>`;
             }
         }
 
-        function renderDashboard(data) {
+        function renderDashboard(data, options = {}) {
             const globalHtml = `
                 <div class="stat-box">
                     <div class="stat-label">Total Clients</div>
@@ -873,13 +899,12 @@
             }
             clientsHtml += '</div>';
             document.getElementById('content').innerHTML = clientsHtml;
-            if (hasNoData) {
+            if (hasNoData && options.allowAutoRefresh !== false) {
                 autoRefreshAfterNoData();
             }
         }
 
         fetchData();
-        setInterval(fetchData, 60000);
     </script>
 </body>
 </html>
