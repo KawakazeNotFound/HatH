@@ -136,6 +136,17 @@ function addFileMetadata(row) {
 	return row;
 }
 
+function getFileHash(fileId) {
+	const match = String(fileId || "").match(/^([a-f0-9]{40})-/);
+	return match ? match[1] : "";
+}
+
+function getSearchFilename(fileId) {
+	const type = String(fileId || "").split("-").pop();
+	const ext = getFileExtension(type) || "bin";
+	return (getFileHash(fileId) || "hath-image") + "." + ext;
+}
+
 function getReadTokenParam(request) {
 	const url = new URL(request.url);
 	const token = url.searchParams.get("token");
@@ -229,6 +240,11 @@ function getStatsApiHeaders(env) {
 
 async function callStatsApi(env, path, options) {
 	const headers = getStatsApiHeaders(env);
+	if(options && options.headers) {
+		for(const [key, value] of Object.entries(options.headers)) {
+			headers.set(key, value);
+		}
+	}
 	let body = null;
 	if(options && options.body !== undefined) {
 		headers.set("Content-Type", "application/json");
@@ -362,6 +378,7 @@ async function flushStatsAggregate(env, clientIp, aggregate) {
 			}
 			const result = await callStatsApi(env, "/v1/stats/aggregate", {
 				method: "POST",
+				headers: { "X-Hath-Client-IP": clientIp },
 				body: { client_ip: clientIp, files: files, ips: {} }
 			});
 			written += Number(result.stat_writes || 0);
@@ -375,6 +392,7 @@ async function flushStatsAggregate(env, clientIp, aggregate) {
 			}
 			const result = await callStatsApi(env, "/v1/stats/aggregate", {
 				method: "POST",
+				headers: { "X-Hath-Client-IP": clientIp },
 				body: { client_ip: clientIp, files: {}, ips: ipRows }
 			});
 			written += Number(result.stat_writes || 0);
@@ -458,6 +476,7 @@ async function writeClientRecord(env, row) {
 	if(hasStatsApi(env)) {
 		await callStatsApi(env, "/v1/clients/upsert", {
 			method: "POST",
+			headers: { "X-Hath-Client-IP": row.client_ip },
 			body: row
 		});
 		return;
@@ -805,14 +824,31 @@ async function handleCacheTree(request, env) {
 }
 
 async function handleCacheFile(request, env) {
+	const result = await fetchClientCacheFile(request, env);
+	if(result.response) {
+		return result.response;
+	}
+
+	const headers = new Headers();
+	headers.set("Content-Type", result.upstream.headers.get("Content-Type") || getMimeType(result.fileId.split("-").pop()));
+	headers.set("Cache-Control", "private, max-age=60");
+	headers.set("Content-Disposition", "inline");
+	const length = result.upstream.headers.get("Content-Length");
+	if(length) {
+		headers.set("Content-Length", length);
+	}
+	return new Response(result.upstream.body, { status: 200, headers: headers });
+}
+
+async function fetchClientCacheFile(request, env) {
 	if(!hasStatsStore(env)) {
-		return statsStoreMissingResponse();
+		return { response: statsStoreMissingResponse() };
 	}
 
 	const url = new URL(request.url);
 	const fileId = String(url.searchParams.get("fileid") || "");
 	if(!/^([a-f0-9]{40})-\d+(?:-\d+-\d+)?-(jpg|png|gif|mp4|wbm|wbp|avf|jxl)$/.test(fileId)) {
-		return jsonResponse({ error: "invalid_fileid" }, 400);
+		return { response: jsonResponse({ error: "invalid_fileid" }, 400) };
 	}
 
 	let client;
@@ -820,15 +856,15 @@ async function handleCacheFile(request, env) {
 		client = await resolveClient(request, env);
 	}
 	catch(e) {
-		return jsonResponse(e.data || { error: e.message || "stats_api_error" }, e.status || 502);
+		return { response: jsonResponse(e.data || { error: e.message || "stats_api_error" }, e.status || 502) };
 	}
 	if(!client) {
-		return jsonResponse({ error: "missing_client" }, 400);
+		return { response: jsonResponse({ error: "missing_client" }, 400) };
 	}
 
 	const cacheRef = parseCacheUrl(client.cache_url);
 	if(!cacheRef) {
-		return jsonResponse({ error: "missing_cache_url" }, 400);
+		return { response: jsonResponse({ error: "missing_cache_url" }, 400) };
 	}
 
 	const clientUrl = buildClientPath(cacheRef, "file", fileId);
@@ -837,21 +873,76 @@ async function handleCacheFile(request, env) {
 		upstream = await fetch(clientUrl);
 	}
 	catch(e) {
-		return jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e), direct_url: clientUrl }, 502);
+		return { response: jsonResponse({ error: "client_fetch_failed", detail: e.message || String(e), direct_url: clientUrl }, 502) };
 	}
 	if(!upstream.ok) {
-		return jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text(), direct_url: clientUrl }, 502);
+		return { response: jsonResponse({ error: "client_fetch_failed", status: upstream.status, detail: await upstream.text(), direct_url: clientUrl }, 502) };
 	}
 
-	const headers = new Headers();
-	headers.set("Content-Type", upstream.headers.get("Content-Type") || getMimeType(fileId.split("-").pop()));
-	headers.set("Cache-Control", "private, max-age=60");
-	headers.set("Content-Disposition", "inline");
-	const length = upstream.headers.get("Content-Length");
-	if(length) {
-		headers.set("Content-Length", length);
+	return { upstream: upstream, fileId: fileId, client: client, clientUrl: clientUrl };
+}
+
+async function handleImageSearch(request, env) {
+	const result = await fetchClientCacheFile(request, env);
+	if(result.response) {
+		return result.response;
 	}
-	return new Response(upstream.body, { status: 200, headers: headers });
+
+	const fileId = result.fileId;
+	const filename = getSearchFilename(fileId);
+	const contentType = result.upstream.headers.get("Content-Type") || getMimeType(fileId.split("-").pop());
+	const exactSearchUrl = "https://e-hentai.org/?f_shash=" + encodeURIComponent(getFileHash(fileId)) + "&fs_from=" + encodeURIComponent(filename);
+	let body;
+	try {
+		body = await result.upstream.arrayBuffer();
+	}
+	catch(e) {
+		return jsonResponse({ error: "image_read_failed", detail: e.message || String(e), search_url: exactSearchUrl }, 502);
+	}
+
+	const form = new FormData();
+	form.set("sfile", new File([body], filename, { type: contentType }));
+	form.set("f_sfile", "File Search");
+	if(new URL(request.url).searchParams.get("covers") === "1") {
+		form.set("fs_covers", "on");
+	}
+	else {
+		form.set("fs_similar", "on");
+	}
+
+	try {
+		const upstream = await fetch("https://upload.e-hentai.org/image_lookup.php", {
+			method: "POST",
+			body: form,
+			redirect: "manual"
+		});
+		const location = upstream.headers.get("Location");
+		if(location) {
+			return jsonResponse({
+				ok: true,
+				mode: "upload_redirect",
+				status: upstream.status,
+				search_url: new URL(location, "https://upload.e-hentai.org/").toString()
+			});
+		}
+
+		const text = await upstream.text();
+		return jsonResponse({
+			ok: upstream.ok,
+			mode: "upload_response",
+			status: upstream.status,
+			search_url: exactSearchUrl,
+			body_sample: text.substring(0, 500)
+		});
+	}
+	catch(e) {
+		return jsonResponse({
+			ok: false,
+			error: "imgsearch_failed",
+			detail: e.message || String(e),
+			search_url: exactSearchUrl
+		});
+	}
 }
 
 async function handleCacheProbe(request, env) {
@@ -1156,6 +1247,14 @@ export default {
 				return authError;
 			}
 			return handleCacheFile(request, env);
+		}
+
+		if(request.method === "POST" && url.pathname === "/v1/imgsearch") {
+			const authError = requireAuth(request, env, "HATH_READ_TOKEN", true);
+			if(authError) {
+				return authError;
+			}
+			return handleImageSearch(request, env);
 		}
 
 		if(request.method === "GET" && url.pathname === "/v1/cache/probe") {

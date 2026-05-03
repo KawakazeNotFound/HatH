@@ -55,11 +55,15 @@ These endpoints are intended for the Worker, not public browser use. All `/v1/*`
 
 - `POST /v1/clients/upsert`
 - `POST /v1/stats/aggregate`
+- `DELETE /v1/clients?client_ip=<ip>`
+- `DELETE /v1/clients?name=<name>`
 - `GET /v1/overview`
 - `GET /v1/clients`
 - `GET /v1/top/files`
 - `GET /v1/top/ips`
 - `GET /v1/client/resolve`
+
+`POST /v1/clients/upsert` and `POST /v1/stats/aggregate` identify the client only from the `X-Hath-Client-IP` header set by the Worker. A `client_ip` field in the JSON body is ignored.
 
 ## Existing D1 data
 

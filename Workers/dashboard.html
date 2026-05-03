@@ -332,6 +332,36 @@
             font-weight: 900;
         }
 
+        .window-actions {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .window-action {
+            background: transparent;
+            border: 1px solid #444;
+            color: #ccc;
+            font-family: inherit;
+            font-size: 0.8rem;
+            font-weight: 900;
+            letter-spacing: 1px;
+            padding: 6px 10px;
+            cursor: pointer;
+            text-transform: uppercase;
+        }
+
+        .window-action:hover:not(:disabled) {
+            color: #fff;
+            border-color: #fff;
+            box-shadow: var(--glow);
+        }
+
+        .window-action:disabled {
+            color: #444;
+            cursor: wait;
+        }
+
         .window-close {
             cursor: pointer;
             color: #fff;
@@ -433,7 +463,10 @@
             <div class="hologram-window">
                 <div class="window-title-bar">
                     <div class="window-title">SYSTEM::SECURE_VIEWER</div>
-                    <div class="window-close" onclick="closeModal()">&times;</div>
+                    <div class="window-actions">
+                        <button id="imgsearch-btn" class="window-action" onclick="searchCurrentImage()">IMGSEARCH</button>
+                        <div class="window-close" onclick="closeModal()">&times;</div>
+                    </div>
                 </div>
                 <div class="window-body">
                     <div class="window-img-container">
@@ -461,6 +494,9 @@
         const hologramModal = document.getElementById('hologram-modal');
         const modalImg = document.getElementById('modal-img');
         const modalFooter = document.getElementById('modal-footer');
+        const imgSearchBtn = document.getElementById('imgsearch-btn');
+        let currentModalFileId = '';
+        let currentModalClientName = '';
 
         document.addEventListener('mousemove', (e) => {
             if (previewWindow.style.display === 'block') {
@@ -514,6 +550,10 @@
             if (!fileid || fileid === 'NO_DATA') return;
             
             hidePreview();
+            currentModalFileId = fileid;
+            currentModalClientName = clientName;
+            imgSearchBtn.disabled = false;
+            imgSearchBtn.textContent = 'IMGSEARCH';
             hologramModal.style.display = 'flex';
             modalImg.src = `/v1/cache/file?fileid=${encodeURIComponent(fileid)}&name=${encodeURIComponent(clientName)}&token=${encodeURIComponent(AUTH_TOKEN)}`;
             
@@ -536,6 +576,31 @@
         function closeModal() {
             hologramModal.style.display = 'none';
             modalImg.src = '';
+            currentModalFileId = '';
+            currentModalClientName = '';
+            imgSearchBtn.disabled = false;
+            imgSearchBtn.textContent = 'IMGSEARCH';
+        }
+
+        async function searchCurrentImage() {
+            if (!currentModalFileId || !currentModalClientName) return;
+
+            imgSearchBtn.disabled = true;
+            imgSearchBtn.textContent = 'SEARCHING';
+            try {
+                const url = `/v1/imgsearch?fileid=${encodeURIComponent(currentModalFileId)}&name=${encodeURIComponent(currentModalClientName)}&token=${encodeURIComponent(AUTH_TOKEN)}`;
+                const response = await fetch(url, { method: 'POST' });
+                const data = await response.json();
+                if (!data.search_url) {
+                    throw new Error(data.error || `HTTP_${response.status}`);
+                }
+                window.open(data.search_url, '_blank', 'noopener');
+            } catch (err) {
+                alert(`IMGSEARCH_FAILED::${err.message}`);
+            } finally {
+                imgSearchBtn.disabled = false;
+                imgSearchBtn.textContent = 'IMGSEARCH';
+            }
         }
 
         window.addEventListener('keydown', (e) => {

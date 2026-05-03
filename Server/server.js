@@ -194,13 +194,23 @@ function requireAuth(req) {
 	return auth === "Bearer " + API_TOKEN || headerToken === API_TOKEN;
 }
 
-async function upsertClient(row) {
+function getRequiredHeader(req, name) {
+	const value = req.headers[name.toLowerCase()];
+	if(typeof value === "string" && value.trim()) {
+		return value.trim();
+	}
+	const err = new Error("missing_" + name.toLowerCase().replace(/-/g, "_"));
+	err.status = 400;
+	throw err;
+}
+
+async function upsertClient(row, clientIp) {
 	await pool.query(
 		"INSERT INTO clients (client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections) " +
 		"VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) " +
 		"ON CONFLICT(client_ip) DO UPDATE SET name=excluded.name, cache_url=CASE WHEN excluded.cache_url <> '' THEN excluded.cache_url ELSE clients.cache_url END, last_seen_ts=excluded.last_seen_ts, timeout_s=excluded.timeout_s, uptime_s=excluded.uptime_s, files_sent=excluded.files_sent, bytes_sent=excluded.bytes_sent, cache_count=excluded.cache_count, cache_size=excluded.cache_size, open_connections=excluded.open_connections",
 		[
-			String(row.client_ip || ""),
+			String(clientIp || ""),
 			String(row.name || ""),
 			String(row.cache_url || ""),
 			asNumber(row.last_seen_ts),
@@ -244,8 +254,8 @@ async function bulkUpsertStats(client, table, clientIp, entries) {
 	return entries.length;
 }
 
-async function upsertAggregate(body) {
-	const clientIp = String(body.client_ip || "");
+async function upsertAggregate(body, clientIp) {
+	clientIp = String(clientIp || "");
 	if(!clientIp) {
 		const err = new Error("missing_client_ip");
 		err.status = 400;
@@ -280,24 +290,21 @@ async function upsertAggregate(body) {
 	}
 }
 
-async function deleteExpiredClients(now) {
-	const cutoff = now - CLIENT_DELETE_AFTER_S;
+async function deleteClientsByIps(clientIps) {
+	const uniqueClientIps = Array.from(new Set((clientIps || []).filter(Boolean)));
+	if(uniqueClientIps.length === 0) {
+		return 0;
+	}
+
 	const client = await pool.connect();
 	try {
 		await client.query("BEGIN");
-		const result = await client.query("SELECT client_ip FROM clients WHERE last_seen_ts <= $1", [cutoff]);
-		const clientIps = result.rows.map((row) => row.client_ip).filter(Boolean);
-		if(clientIps.length === 0) {
-			await client.query("COMMIT");
-			return 0;
-		}
-
-		await client.query("DELETE FROM file_stats WHERE client_ip = ANY($1::text[])", [clientIps]);
-		await client.query("DELETE FROM ip_stats WHERE client_ip = ANY($1::text[])", [clientIps]);
-		await client.query("DELETE FROM client_totals WHERE client_ip = ANY($1::text[])", [clientIps]);
-		await client.query("DELETE FROM clients WHERE client_ip = ANY($1::text[])", [clientIps]);
+		await client.query("DELETE FROM file_stats WHERE client_ip = ANY($1::text[])", [uniqueClientIps]);
+		await client.query("DELETE FROM ip_stats WHERE client_ip = ANY($1::text[])", [uniqueClientIps]);
+		await client.query("DELETE FROM client_totals WHERE client_ip = ANY($1::text[])", [uniqueClientIps]);
+		await client.query("DELETE FROM clients WHERE client_ip = ANY($1::text[])", [uniqueClientIps]);
 		await client.query("COMMIT");
-		return clientIps.length;
+		return uniqueClientIps.length;
 	}
 	catch(e) {
 		await client.query("ROLLBACK");
@@ -306,6 +313,33 @@ async function deleteExpiredClients(now) {
 	finally {
 		client.release();
 	}
+}
+
+async function deleteExpiredClients(now) {
+	const cutoff = now - CLIENT_DELETE_AFTER_S;
+	const result = await pool.query("SELECT client_ip FROM clients WHERE last_seen_ts <= $1", [cutoff]);
+	return deleteClientsByIps(result.rows.map((row) => row.client_ip));
+}
+
+async function deleteClient(url) {
+	const clientIp = url.searchParams.get("client_ip");
+	const name = url.searchParams.get("name");
+	let result;
+	if(clientIp) {
+		result = await pool.query("SELECT client_ip FROM clients WHERE client_ip = $1", [clientIp]);
+	}
+	else if(name) {
+		result = await pool.query("SELECT client_ip FROM clients WHERE name = $1", [name]);
+	}
+	else {
+		const err = new Error("missing_client");
+		err.status = 400;
+		throw err;
+	}
+
+	return {
+		deleted_clients: await deleteClientsByIps(result.rows.map((row) => row.client_ip))
+	};
 }
 
 async function resolveClient(url) {
@@ -505,13 +539,18 @@ async function route(req, res) {
 	}
 
 	if(req.method === "POST" && url.pathname === "/v1/clients/upsert") {
-		await upsertClient(await readJson(req));
+		await upsertClient(await readJson(req), getRequiredHeader(req, "X-Hath-Client-IP"));
 		json(res, 200, { ok: true, client_writes: 1 });
 		return;
 	}
 
+	if(req.method === "DELETE" && url.pathname === "/v1/clients") {
+		json(res, 200, Object.assign({ ok: true }, await deleteClient(url)));
+		return;
+	}
+
 	if(req.method === "POST" && url.pathname === "/v1/stats/aggregate") {
-		json(res, 200, Object.assign({ ok: true }, await upsertAggregate(await readJson(req))));
+		json(res, 200, Object.assign({ ok: true }, await upsertAggregate(await readJson(req), getRequiredHeader(req, "X-Hath-Client-IP"))));
 		return;
 	}
 
