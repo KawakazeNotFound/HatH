@@ -15,19 +15,21 @@ CREATE TABLE IF NOT EXISTS clients (
 CREATE TABLE IF NOT EXISTS file_stats (
 	client_ip TEXT NOT NULL,
 	fileid TEXT NOT NULL,
+	bucket_ts BIGINT NOT NULL DEFAULT 0,
 	request_count BIGINT NOT NULL DEFAULT 0,
 	bytes_sent BIGINT NOT NULL DEFAULT 0,
 	last_seen_ts BIGINT NOT NULL DEFAULT 0,
-	PRIMARY KEY (client_ip, fileid)
+	PRIMARY KEY (client_ip, fileid, bucket_ts)
 );
 
 CREATE TABLE IF NOT EXISTS ip_stats (
 	client_ip TEXT NOT NULL,
 	requester_ip TEXT NOT NULL,
+	bucket_ts BIGINT NOT NULL DEFAULT 0,
 	request_count BIGINT NOT NULL DEFAULT 0,
 	bytes_sent BIGINT NOT NULL DEFAULT 0,
 	last_seen_ts BIGINT NOT NULL DEFAULT 0,
-	PRIMARY KEY (client_ip, requester_ip)
+	PRIMARY KEY (client_ip, requester_ip, bucket_ts)
 );
 
 CREATE TABLE IF NOT EXISTS client_totals (
@@ -46,8 +48,8 @@ CREATE INDEX IF NOT EXISTS clients_cache_url_last_seen_idx
 	ON clients (last_seen_ts DESC)
 	WHERE cache_url IS NOT NULL AND cache_url <> '';
 
-CREATE INDEX IF NOT EXISTS file_stats_client_top_idx
-	ON file_stats (client_ip, request_count DESC, bytes_sent DESC);
+CREATE INDEX IF NOT EXISTS file_stats_client_range_idx
+	ON file_stats (client_ip, bucket_ts DESC);
 
-CREATE INDEX IF NOT EXISTS ip_stats_client_top_idx
-	ON ip_stats (client_ip, request_count DESC, bytes_sent DESC);
+CREATE INDEX IF NOT EXISTS ip_stats_client_range_idx
+	ON ip_stats (client_ip, bucket_ts DESC);

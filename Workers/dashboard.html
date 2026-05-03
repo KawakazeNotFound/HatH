@@ -460,7 +460,18 @@
         <header>
             <div class="header-top">
                 <h1>DATA::SYSTEM::OVERVIEW</h1>
-                <button id="refresh-btn" class="window-action" onclick="manualRefresh()" style="font-size: 1.1rem; padding: 10px 20px;">REFRESH SYSTEM</button>
+                <div style="display: flex; gap: 20px; align-items: center;">
+                    <label style="font-size: 1rem; color: var(--muted); text-transform: uppercase; font-weight: 800;">
+                        RANGE: 
+                        <select id="range" onchange="fetchData()" class="window-action" style="background: #000; color: #fff; border-color: #444; margin-left: 10px; cursor: pointer;">
+                            <option value="all">ALL_TIME</option>
+                            <option value="24h">LAST_24H</option>
+                            <option value="7d">LAST_7D</option>
+                            <option value="30d">LAST_30D</option>
+                        </select>
+                    </label>
+                    <button id="refresh-btn" class="window-action" onclick="manualRefresh()" style="font-size: 1.1rem; padding: 10px 20px;">REFRESH SYSTEM</button>
+                </div>
             </div>
             <div id="global-stats" class="global-stats">
                 <!-- Global stats injected here -->
@@ -521,6 +532,7 @@
         const imgSearchBtn = document.getElementById('imgsearch-btn');
         let currentModalFileId = '';
         let currentModalClientName = '';
+        let autoRefreshAfterNoDataTried = false;
 
         function getAuthQuery() {
             return (AUTH_TOKEN && AUTH_TOKEN !== "{"+"{AUTH_TOKEN}}") ? `&token=${encodeURIComponent(AUTH_TOKEN)}` : '';
@@ -544,6 +556,20 @@
                 alert(`REFRESH_FAILED::${err.message}`);
                 btn.textContent = 'FAILED';
                 btn.disabled = false;
+            }
+        }
+
+        async function autoRefreshAfterNoData() {
+            if (autoRefreshAfterNoDataTried) return;
+
+            autoRefreshAfterNoDataTried = true;
+            try {
+                const response = await fetch(`/v1/refresh?all=1${getAuthQuery()}`, { method: 'POST' });
+                if (response.ok) {
+                    await fetchData();
+                }
+            } catch (err) {
+                console.warn(`AUTO_REFRESH_FAILED::${err.message}`);
             }
         }
 
@@ -738,7 +764,8 @@
 
         async function fetchData() {
             try {
-                const response = await fetch(`/v1/overview?tz=${new Date().getTimezoneOffset()}${getAuthQuery()}`);
+                const range = document.getElementById('range').value;
+                const response = await fetch(`/v1/overview?tz=${new Date().getTimezoneOffset()}&range=${range}${getAuthQuery()}`);
                 if (!response.ok) throw new Error(`HTTP_${response.status}`);
                 const data = await response.json();
                 renderDashboard(data);
@@ -766,12 +793,16 @@
 
             let clientsHtml = '<div class="client-grid">';
             const clients = Object.values(data.clients).sort((a, b) => b.last_seen_ts - a.last_seen_ts);
+            let hasNoData = false;
 
             for (const client of clients) {
                 const topFile = client.top_file;
                 const topIp = client.top_ip;
                 const topFiles = client.top_files || (topFile ? [topFile] : []);
                 const topIps = client.top_ips || (topIp ? [topIp] : []);
+                if (!topFile || !topIp) {
+                    hasNoData = true;
+                }
 
                 clientsHtml += `
                     <div class="client-card">
@@ -842,6 +873,9 @@
             }
             clientsHtml += '</div>';
             document.getElementById('content').innerHTML = clientsHtml;
+            if (hasNoData) {
+                autoRefreshAfterNoData();
+            }
         }
 
         fetchData();

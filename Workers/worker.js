@@ -7,8 +7,10 @@ const D1_BATCH_SIZE = 50;
 const STATS_API_BATCH_SIZE = 500;
 const DO_CHECKPOINT_INTERVAL_S = 60;
 const DO_CHECKPOINT_EVENT_LIMIT = 1000;
+const READ_FLUSH_INTERVAL_S = 60;
 const CLIENT_INACTIVE_AFTER_S = 2 * 60 * 60;
-const CLIENT_DELETE_AFTER_S = 12 * 60 * 60;
+const CLIENT_DELETE_AFTER_S = 7 * 24 * 60 * 60;
+const STATS_DELETE_AFTER_S = 30 * 24 * 60 * 60;
 
 function jsonResponse(data, status) {
 	return new Response(JSON.stringify(data), { status: status || 200, headers: JSON_HEADERS });
@@ -355,24 +357,26 @@ function addAggRow(map, key, bytes, ts) {
 	map[key] = current;
 }
 
-function bindStatStatement(env, table, clientIp, key, row) {
+function bindStatStatement(env, table, clientIp, bucketTs, key, row) {
 	if(table === "file") {
 		return env.HATH_DB.prepare(
-			"INSERT INTO file_stats (client_ip, fileid, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, ?, ?, ?) " +
-			"ON CONFLICT(client_ip, fileid) DO UPDATE SET request_count=request_count+excluded.request_count, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=MAX(file_stats.last_seen_ts, excluded.last_seen_ts)"
-		).bind(clientIp, key, row.request_count, row.bytes_sent, row.last_seen_ts);
+			"INSERT INTO file_stats (client_ip, fileid, bucket_ts, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, ?, ?, ?, ?) " +
+			"ON CONFLICT(client_ip, fileid, bucket_ts) DO UPDATE SET request_count=file_stats.request_count+excluded.request_count, bytes_sent=file_stats.bytes_sent+excluded.bytes_sent, last_seen_ts=MAX(file_stats.last_seen_ts, excluded.last_seen_ts)"
+		).bind(clientIp, key, bucketTs, row.request_count, row.bytes_sent, row.last_seen_ts);
 	}
 
 	return env.HATH_DB.prepare(
-		"INSERT INTO ip_stats (client_ip, requester_ip, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, ?, ?, ?) " +
-		"ON CONFLICT(client_ip, requester_ip) DO UPDATE SET request_count=request_count+excluded.request_count, bytes_sent=bytes_sent+excluded.bytes_sent, last_seen_ts=MAX(ip_stats.last_seen_ts, excluded.last_seen_ts)"
-	).bind(clientIp, key, row.request_count, row.bytes_sent, row.last_seen_ts);
+		"INSERT INTO ip_stats (client_ip, requester_ip, bucket_ts, request_count, bytes_sent, last_seen_ts) VALUES (?, ?, ?, ?, ?, ?) " +
+		"ON CONFLICT(client_ip, requester_ip, bucket_ts) DO UPDATE SET request_count=ip_stats.request_count+excluded.request_count, bytes_sent=ip_stats.bytes_sent+excluded.bytes_sent, last_seen_ts=MAX(ip_stats.last_seen_ts, excluded.last_seen_ts)"
+	).bind(clientIp, key, bucketTs, row.request_count, row.bytes_sent, row.last_seen_ts);
 }
 
 async function flushStatsAggregate(env, clientIp, aggregate) {
 	if(!aggregate || !aggregate.client_ip) {
 		return 0;
 	}
+
+	const bucketTs = Number(aggregate.bucket_start_ts || 0);
 
 	if(hasStatsApi(env)) {
 		let written = 0;
@@ -385,7 +389,7 @@ async function flushStatsAggregate(env, clientIp, aggregate) {
 			const result = await callStatsApi(env, "/v1/stats/aggregate", {
 				method: "POST",
 				headers: { "X-Hath-Client-IP": clientIp },
-				body: { client_ip: clientIp, files: files, ips: {} }
+				body: { client_ip: clientIp, bucket_ts: bucketTs, files: files, ips: {} }
 			});
 			written += Number(result.stat_writes || 0);
 		}
@@ -399,7 +403,7 @@ async function flushStatsAggregate(env, clientIp, aggregate) {
 			const result = await callStatsApi(env, "/v1/stats/aggregate", {
 				method: "POST",
 				headers: { "X-Hath-Client-IP": clientIp },
-				body: { client_ip: clientIp, files: {}, ips: ipRows }
+				body: { client_ip: clientIp, bucket_ts: bucketTs, files: {}, ips: ipRows }
 			});
 			written += Number(result.stat_writes || 0);
 		}
@@ -409,11 +413,11 @@ async function flushStatsAggregate(env, clientIp, aggregate) {
 
 	const stmts = [];
 	for(const fileId of Object.keys(aggregate.files || {})) {
-		stmts.push(bindStatStatement(env, "file", clientIp, fileId, aggregate.files[fileId]));
+		stmts.push(bindStatStatement(env, "file", clientIp, bucketTs, fileId, aggregate.files[fileId]));
 	}
 
 	for(const ip of Object.keys(aggregate.ips || {})) {
-		stmts.push(bindStatStatement(env, "ip", clientIp, ip, aggregate.ips[ip]));
+		stmts.push(bindStatStatement(env, "ip", clientIp, bucketTs, ip, aggregate.ips[ip]));
 	}
 
 	for(let i = 0; i < stmts.length; i += D1_BATCH_SIZE) {
@@ -532,12 +536,27 @@ async function queueClientRecord(env, clients, row) {
 }
 
 async function deleteExpiredClients(env, now) {
-	const cutoff = now - CLIENT_DELETE_AFTER_S;
+	const cutoffClient = now - CLIENT_DELETE_AFTER_S;
+	const cutoffStats = now - STATS_DELETE_AFTER_S;
 	await env.HATH_DB.batch([
-		env.HATH_DB.prepare("DELETE FROM file_stats WHERE client_ip IN (SELECT client_ip FROM clients WHERE last_seen_ts <= ?)").bind(cutoff),
-		env.HATH_DB.prepare("DELETE FROM ip_stats WHERE client_ip IN (SELECT client_ip FROM clients WHERE last_seen_ts <= ?)").bind(cutoff),
-		env.HATH_DB.prepare("DELETE FROM clients WHERE last_seen_ts <= ?").bind(cutoff)
+		env.HATH_DB.prepare("DELETE FROM file_stats WHERE bucket_ts > 0 AND bucket_ts < ?").bind(cutoffStats),
+		env.HATH_DB.prepare("DELETE FROM ip_stats WHERE bucket_ts > 0 AND bucket_ts < ?").bind(cutoffStats),
+		env.HATH_DB.prepare("DELETE FROM clients WHERE last_seen_ts <= ?").bind(cutoffClient)
 	]);
+}
+
+async function flushRecentStatsForRead(request, env) {
+	if(!env.HATH_STATS) {
+		return;
+	}
+
+	const url = new URL(request.url);
+	url.searchParams.set("read", "1");
+	const flushRequest = new Request(url.toString(), {
+		method: "POST",
+		headers: request.headers
+	});
+	await forwardToStatsDo(flushRequest, env, "/flush");
 }
 
 async function handleIngest(request, env) {
@@ -568,24 +587,37 @@ async function handleRefresh(request, env) {
 	return forwardToStatsDo(refreshRequest, env, "/flush");
 }
 
+function getSinceTs(range, now) {
+	if(range === "24h") return now - 86400;
+	if(range === "7d") return now - 7 * 86400;
+	if(range === "30d") return now - 30 * 86400;
+	return 0;
+}
+
 async function handleOverview(request, env) {
 	if(!hasStatsStore(env)) {
 		return statsStoreMissingResponse();
 	}
 
+	await flushRecentStatsForRead(request, env);
+
 	if(hasStatsApi(env)) {
-		return proxyStatsApiJson(env, copyQuery(request, "/v1/overview", ["tz"]));
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/overview", ["tz", "range"]));
 	}
 
+	const url = new URL(request.url);
+	const range = url.searchParams.get("range") || "all";
 	const now = Math.floor(Date.now() / 1000);
+	const since = getSinceTs(range, now);
+
 	await deleteExpiredClients(env, now);
 
-	const tzOffsetSeconds = getTzOffsetSeconds(new URL(request.url));
+	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	const res = await env.HATH_DB.prepare(
 		"SELECT client_ip, name, cache_url, last_seen_ts, timeout_s, uptime_s, files_sent, bytes_sent, cache_count, cache_size, open_connections, " +
-		"(SELECT SUM(request_count) FROM file_stats f WHERE f.client_ip = c.client_ip) AS total_requests " +
+		"(SELECT SUM(request_count) FROM file_stats f WHERE f.client_ip = c.client_ip AND f.bucket_ts >= ?) AS total_requests " +
 		"FROM clients c ORDER BY last_seen_ts DESC"
-	).all();
+	).bind(since).all();
 
 	const clientsByName = {};
 	let totalRequests = 0;
@@ -601,8 +633,8 @@ async function handleOverview(request, env) {
 
 		if(clientIp) {
 			const topFileRes = await env.HATH_DB.prepare(
-				"SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 10"
-			).bind(clientIp).all();
+				"SELECT fileid, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM file_stats WHERE client_ip = ? AND bucket_ts >= ? GROUP BY fileid ORDER BY request_count DESC, bytes_sent DESC LIMIT 10"
+			).bind(clientIp, since).all();
 			topFiles = (topFileRes.results || []).map((topFile) => {
 				addFileMetadata(topFile);
 				topFile.last_seen = formatTimestamp(topFile.last_seen_ts, tzOffsetSeconds);
@@ -610,8 +642,8 @@ async function handleOverview(request, env) {
 			});
 
 			const topIpRes = await env.HATH_DB.prepare(
-				"SELECT requester_ip AS ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC, bytes_sent DESC LIMIT 10"
-			).bind(clientIp).all();
+				"SELECT requester_ip AS ip, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM ip_stats WHERE client_ip = ? AND bucket_ts >= ? GROUP BY requester_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 10"
+			).bind(clientIp, since).all();
 			topIps = (topIpRes.results || []).map((topIp) => {
 				topIp.last_seen = formatTimestamp(topIp.last_seen_ts, tzOffsetSeconds);
 				return topIp;
@@ -689,11 +721,17 @@ async function handleTopFiles(request, env) {
 		return statsStoreMissingResponse();
 	}
 
+	await flushRecentStatsForRead(request, env);
+
 	if(hasStatsApi(env)) {
-		return proxyStatsApiJson(env, copyQuery(request, "/v1/top/files", ["client_ip", "name", "limit", "tz"]));
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/top/files", ["client_ip", "name", "limit", "tz", "range"]));
 	}
 
 	const url = new URL(request.url);
+	const range = url.searchParams.get("range") || "all";
+	const now = Math.floor(Date.now() / 1000);
+	const since = getSinceTs(range, now);
+
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	let clientIp = url.searchParams.get("client_ip");
 	const name = url.searchParams.get("name");
@@ -705,7 +743,9 @@ async function handleTopFiles(request, env) {
 		return jsonResponse({ error: "missing_client" }, 400);
 	}
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
-	const res = await env.HATH_DB.prepare("SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = ? ORDER BY request_count DESC LIMIT ?").bind(clientIp, limit).all();
+	const res = await env.HATH_DB.prepare(
+		"SELECT fileid, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM file_stats WHERE client_ip = ? AND bucket_ts >= ? GROUP BY fileid ORDER BY request_count DESC LIMIT ?"
+	).bind(clientIp, since, limit).all();
 	const files = (res.results || []).map((row) => {
 		addFileMetadata(row);
 		row.last_seen = formatTimestamp(row.last_seen_ts, tzOffsetSeconds);
@@ -719,11 +759,17 @@ async function handleTopIps(request, env) {
 		return statsStoreMissingResponse();
 	}
 
+	await flushRecentStatsForRead(request, env);
+
 	if(hasStatsApi(env)) {
-		return proxyStatsApiJson(env, copyQuery(request, "/v1/top/ips", ["client_ip", "name", "limit", "tz"]));
+		return proxyStatsApiJson(env, copyQuery(request, "/v1/top/ips", ["client_ip", "name", "limit", "tz", "range"]));
 	}
 
 	const url = new URL(request.url);
+	const range = url.searchParams.get("range") || "all";
+	const now = Math.floor(Date.now() / 1000);
+	const since = getSinceTs(range, now);
+
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
 	let clientIp = url.searchParams.get("client_ip");
 	const name = url.searchParams.get("name");
@@ -735,7 +781,9 @@ async function handleTopIps(request, env) {
 		return jsonResponse({ error: "missing_client" }, 400);
 	}
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
-	const res = await env.HATH_DB.prepare("SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = ? ORDER BY request_count DESC LIMIT ?").bind(clientIp, limit).all();
+	const res = await env.HATH_DB.prepare(
+		"SELECT requester_ip, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM ip_stats WHERE client_ip = ? AND bucket_ts >= ? GROUP BY requester_ip ORDER BY request_count DESC LIMIT ?"
+	).bind(clientIp, since, limit).all();
 	const ips = (res.results || []).map((row) => {
 		row.last_seen = formatTimestamp(row.last_seen_ts, tzOffsetSeconds);
 		return row;
@@ -1008,15 +1056,17 @@ export class HathStatsDurableObject {
 		this.clients = new Map();
 		this.pendingEvents = 0;
 		this.lastCheckpointMs = 0;
+		this.lastReadFlushMs = 0;
 		this.loaded = this.load();
 	}
 
 	async load() {
-		const stored = await this.state.storage.get(["stats", "clients", "pending_events", "last_checkpoint_ms"]);
+		const stored = await this.state.storage.get(["stats", "clients", "pending_events", "last_checkpoint_ms", "last_read_flush_ms"]);
 		this.stats = new Map(Object.entries(stored.get("stats") || {}));
 		this.clients = new Map(Object.entries(stored.get("clients") || {}));
 		this.pendingEvents = Number(stored.get("pending_events") || 0);
 		this.lastCheckpointMs = Number(stored.get("last_checkpoint_ms") || 0);
+		this.lastReadFlushMs = Number(stored.get("last_read_flush_ms") || 0);
 
 		const alarm = await this.state.storage.getAlarm();
 		if(alarm === null) {
@@ -1034,7 +1084,8 @@ export class HathStatsDurableObject {
 			stats: Object.fromEntries(this.stats),
 			clients: Object.fromEntries(this.clients),
 			pending_events: 0,
-			last_checkpoint_ms: nowMs
+			last_checkpoint_ms: nowMs,
+			last_read_flush_ms: this.lastReadFlushMs
 		});
 		this.pendingEvents = 0;
 		this.lastCheckpointMs = nowMs;
@@ -1105,6 +1156,24 @@ export class HathStatsDurableObject {
 		return { clientWrites: clientWrites, statWrites: statWrites };
 	}
 
+	async flushForRead() {
+		const nowMs = Date.now();
+		if(nowMs - this.lastReadFlushMs < READ_FLUSH_INTERVAL_S * 1000) {
+			return { clientWrites: 0, statWrites: 0, throttled: true };
+		}
+
+		if(this.clients.size === 0 && this.stats.size === 0) {
+			this.lastReadFlushMs = nowMs;
+			await this.checkpoint(true);
+			return { clientWrites: 0, statWrites: 0, throttled: false };
+		}
+
+		this.lastReadFlushMs = nowMs;
+		const flushed = await this.flushAll();
+		flushed.throttled = false;
+		return flushed;
+	}
+
 	async handleIngest(request) {
 		let body;
 		try {
@@ -1140,15 +1209,17 @@ export class HathStatsDurableObject {
 	async handleFlush(request) {
 		const url = new URL(request.url);
 		const all = url.searchParams.get("all") === "1" || url.searchParams.get("all") === "true";
+		const read = url.searchParams.get("read") === "1" || url.searchParams.get("read") === "true";
 		const clientIp = url.searchParams.get("client_ip") || request.headers.get("X-Hath-Client-IP") || "unknown";
-		const flushed = all ? await this.flushAll() : await this.flushClient(clientIp);
+		const flushed = read ? await this.flushForRead() : all ? await this.flushAll() : await this.flushClient(clientIp);
 		return jsonResponse({
 			ok: true,
 			mode: "durable_object",
-			client_ip: all ? null : clientIp,
+			client_ip: all || read ? null : clientIp,
 			flushed: flushed.clientWrites + flushed.statWrites,
 			client_writes: flushed.clientWrites,
-			stat_writes: flushed.statWrites
+			stat_writes: flushed.statWrites,
+			throttled: !!flushed.throttled
 		});
 	}
 

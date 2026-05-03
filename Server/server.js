@@ -6,7 +6,15 @@ const PORT = Number(process.env.PORT || 8789);
 const API_TOKEN = process.env.HATH_API_TOKEN || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
 const CLIENT_INACTIVE_AFTER_S = 2 * 60 * 60;
-const CLIENT_DELETE_AFTER_S = 12 * 60 * 60;
+const CLIENT_DELETE_AFTER_S = 7 * 24 * 60 * 60;
+const STATS_DELETE_AFTER_S = 30 * 24 * 60 * 60;
+
+function getSinceTs(range, now) {
+	if(range === "24h") return now - 86400;
+	if(range === "7d") return now - 7 * 86400;
+	if(range === "30d") return now - 30 * 86400;
+	return 0;
+}
 
 if(!DATABASE_URL) {
 	console.error("Missing DATABASE_URL");
@@ -229,7 +237,7 @@ function statEntries(rows) {
 	return Object.entries(rows || {}).filter(([key]) => key);
 }
 
-async function bulkUpsertStats(client, table, clientIp, entries) {
+async function bulkUpsertStats(client, table, clientIp, bucketTs, entries) {
 	if(entries.length === 0) {
 		return 0;
 	}
@@ -239,14 +247,14 @@ async function bulkUpsertStats(client, table, clientIp, entries) {
 		const chunk = entries.slice(offset, offset + 500);
 		const values = [];
 		const placeholders = chunk.map(([key, row], index) => {
-			const base = index * 5;
-			values.push(clientIp, key, asNumber(row.request_count), asNumber(row.bytes_sent), asNumber(row.last_seen_ts));
-			return "($" + (base + 1) + ",$" + (base + 2) + ",$" + (base + 3) + ",$" + (base + 4) + ",$" + (base + 5) + ")";
+			const base = index * 6;
+			values.push(clientIp, key, bucketTs, asNumber(row.request_count), asNumber(row.bytes_sent), asNumber(row.last_seen_ts));
+			return "($" + (base + 1) + ",$" + (base + 2) + ",$" + (base + 3) + ",$" + (base + 4) + ",$" + (base + 5) + ",$" + (base + 6) + ")";
 		}).join(",");
 
 		await client.query(
-			"INSERT INTO " + table + " (client_ip, " + keyColumn + ", request_count, bytes_sent, last_seen_ts) VALUES " + placeholders + " " +
-			"ON CONFLICT(client_ip, " + keyColumn + ") DO UPDATE SET request_count=" + table + ".request_count+excluded.request_count, bytes_sent=" + table + ".bytes_sent+excluded.bytes_sent, last_seen_ts=GREATEST(" + table + ".last_seen_ts, excluded.last_seen_ts)",
+			"INSERT INTO " + table + " (client_ip, " + keyColumn + ", bucket_ts, request_count, bytes_sent, last_seen_ts) VALUES " + placeholders + " " +
+			"ON CONFLICT(client_ip, " + keyColumn + ", bucket_ts) DO UPDATE SET request_count=" + table + ".request_count+excluded.request_count, bytes_sent=" + table + ".bytes_sent+excluded.bytes_sent, last_seen_ts=GREATEST(" + table + ".last_seen_ts, excluded.last_seen_ts)",
 			values
 		);
 	}
@@ -262,6 +270,7 @@ async function upsertAggregate(body, clientIp) {
 		throw err;
 	}
 
+	const bucketTs = asNumber(body.bucket_ts);
 	const fileEntries = statEntries(body.files);
 	const ipEntries = statEntries(body.ips);
 	const totalRequests = fileEntries.reduce((sum, [, row]) => sum + asNumber(row.request_count), 0);
@@ -269,8 +278,8 @@ async function upsertAggregate(body, clientIp) {
 	const client = await pool.connect();
 	try {
 		await client.query("BEGIN");
-		await bulkUpsertStats(client, "file_stats", clientIp, fileEntries);
-		await bulkUpsertStats(client, "ip_stats", clientIp, ipEntries);
+		await bulkUpsertStats(client, "file_stats", clientIp, bucketTs, fileEntries);
+		await bulkUpsertStats(client, "ip_stats", clientIp, bucketTs, ipEntries);
 		if(totalRequests > 0 || totalBytes > 0) {
 			await client.query(
 				"INSERT INTO client_totals (client_ip, total_requests, bytes_sent) VALUES ($1,$2,$3) " +
@@ -316,8 +325,11 @@ async function deleteClientsByIps(clientIps) {
 }
 
 async function deleteExpiredClients(now) {
-	const cutoff = now - CLIENT_DELETE_AFTER_S;
-	const result = await pool.query("SELECT client_ip FROM clients WHERE last_seen_ts <= $1", [cutoff]);
+	const cutoffClient = now - CLIENT_DELETE_AFTER_S;
+	const cutoffStats = now - STATS_DELETE_AFTER_S;
+	await pool.query("DELETE FROM file_stats WHERE bucket_ts > 0 AND bucket_ts < $1", [cutoffStats]);
+	await pool.query("DELETE FROM ip_stats WHERE bucket_ts > 0 AND bucket_ts < $1", [cutoffStats]);
+	const result = await pool.query("SELECT client_ip FROM clients WHERE last_seen_ts <= $1", [cutoffClient]);
 	return deleteClientsByIps(result.rows.map((row) => row.client_ip));
 }
 
@@ -366,20 +378,24 @@ async function overview(url) {
 	await deleteExpiredClients(now);
 
 	const tzOffsetSeconds = getTzOffsetSeconds(url);
+	const range = url.searchParams.get("range") || "all";
+	const since = getSinceTs(range, now);
+
 	const result = await pool.query(
-		"SELECT c.*, COALESCE(ct.total_requests, 0) AS total_requests, " +
+		"SELECT c.*, " +
+		"(SELECT SUM(request_count) FROM file_stats WHERE client_ip = c.client_ip AND bucket_ts >= $1) AS total_requests, " +
 		"tf.top_files, ti.top_ips " +
 		"FROM clients c " +
-		"LEFT JOIN client_totals ct ON ct.client_ip = c.client_ip " +
 		"LEFT JOIN LATERAL (" +
 		"SELECT json_agg(json_build_object('fileid', fileid, 'request_count', request_count, 'bytes_sent', bytes_sent, 'last_seen_ts', last_seen_ts) ORDER BY request_count DESC, bytes_sent DESC) AS top_files " +
-		"FROM (SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = c.client_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 10) ranked_files" +
+		"FROM (SELECT fileid, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM file_stats WHERE client_ip = c.client_ip AND bucket_ts >= $1 GROUP BY fileid ORDER BY request_count DESC, bytes_sent DESC LIMIT 10) ranked_files" +
 		") tf ON true " +
 		"LEFT JOIN LATERAL (" +
 		"SELECT json_agg(json_build_object('ip', requester_ip, 'request_count', request_count, 'bytes_sent', bytes_sent, 'last_seen_ts', last_seen_ts) ORDER BY request_count DESC, bytes_sent DESC) AS top_ips " +
-		"FROM (SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = c.client_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 10) ranked_ips" +
+		"FROM (SELECT requester_ip, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM ip_stats WHERE client_ip = c.client_ip AND bucket_ts >= $1 GROUP BY requester_ip ORDER BY request_count DESC, bytes_sent DESC LIMIT 10) ranked_ips" +
 		") ti ON true " +
-		"ORDER BY c.last_seen_ts DESC"
+		"ORDER BY c.last_seen_ts DESC",
+		[since]
 	);
 
 	const clientsByName = {};
@@ -482,8 +498,11 @@ async function topFiles(url) {
 		throw err;
 	}
 
+	const now = Math.floor(Date.now() / 1000);
+	const range = url.searchParams.get("range") || "all";
+	const since = getSinceTs(range, now);
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
-	const result = await pool.query("SELECT fileid, request_count, bytes_sent, last_seen_ts FROM file_stats WHERE client_ip = $1 ORDER BY request_count DESC LIMIT $2", [client.client_ip, limit]);
+	const result = await pool.query("SELECT fileid, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM file_stats WHERE client_ip = $1 AND bucket_ts >= $2 GROUP BY fileid ORDER BY request_count DESC LIMIT $3", [client.client_ip, since, limit]);
 	return {
 		files: result.rows.map((row) => {
 			const file = addFileMetadata({
@@ -513,8 +532,11 @@ async function topIps(url) {
 		throw err;
 	}
 
+	const now = Math.floor(Date.now() / 1000);
+	const range = url.searchParams.get("range") || "all";
+	const since = getSinceTs(range, now);
 	const limit = Math.min(Number(url.searchParams.get("limit") || 50), 500);
-	const result = await pool.query("SELECT requester_ip, request_count, bytes_sent, last_seen_ts FROM ip_stats WHERE client_ip = $1 ORDER BY request_count DESC LIMIT $2", [client.client_ip, limit]);
+	const result = await pool.query("SELECT requester_ip, SUM(request_count) AS request_count, SUM(bytes_sent) AS bytes_sent, MAX(last_seen_ts) AS last_seen_ts FROM ip_stats WHERE client_ip = $1 AND bucket_ts >= $2 GROUP BY requester_ip ORDER BY request_count DESC LIMIT $3", [client.client_ip, since, limit]);
 	return {
 		ips: result.rows.map((row) => ({
 			requester_ip: row.requester_ip,
